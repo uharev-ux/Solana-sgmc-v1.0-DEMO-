@@ -76,3 +76,42 @@ python -m dexscreener_screener.cli export --table snapshots --format csv --out s
 ```bash
 python -m dexscreener_screener.cli export --table pairs --format json --out pairs.json --db dexscreener.sqlite
 ```
+
+### Prune (очистка устаревших данных)
+
+База автоматически хранит **только пары моложе 24 часов** (по `pair_created_at_ms`). Пары старше 24h удаляются автоматически при каждом успешном `collect` и каждом цикле `collect-new`. Пары с `pair_created_at_ms IS NULL` или `0` не удаляются по возрасту.
+
+**Ручной запуск prune:**
+```bash
+python -m dexscreener_screener.cli prune --db dexscreener.sqlite --max-age-hours 24
+```
+
+**Dry-run** — показать, что будет удалено, без изменений в базе:
+```bash
+python -m dexscreener_screener.cli prune --db dexscreener.sqlite --max-age-hours 24 --dry-run
+```
+
+**VACUUM** — после удаления освободить место на диске (рекомендуется периодически):
+```bash
+python -m dexscreener_screener.cli prune --db dexscreener.sqlite --max-age-hours 24 --vacuum
+```
+
+**Отключить auto-prune** в collect/collect-new:
+```bash
+python -m dexscreener_screener.cli collect --pairs pairs.csv --no-prune
+python -m dexscreener_screener.cli collect-new --no-prune
+```
+
+### Self-check (проверка инвариантов БД)
+
+Проверка, что в БД только пары моложе 24h (инварианты prune_by_pair_age). Exit code: 0 = OK, 2 = FAIL.
+
+```bash
+python -m dexscreener_screener.cli self-check --db dexscreener.sqlite
+```
+
+С автоматическим исправлением при нарушении (запуск prune и повторная проверка):
+
+```bash
+python -m dexscreener_screener.cli self-check --db dexscreener.sqlite --fix
+```

@@ -1,0 +1,16 @@
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# SQLite databases
+*.sqlite
+
+# Local executables
+sqlite3.exe
+
+# Local JSON dumps
+dump_*.json
+snapshots.json

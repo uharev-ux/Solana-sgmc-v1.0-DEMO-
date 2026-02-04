@@ -79,6 +79,110 @@ def smoke_db_and_collect() -> bool:
     return True
 
 
+def smoke_prune_dry_run() -> bool:
+    """Prune --dry-run on empty and filled DB."""
+    print("Smoke: prune --dry-run ...")
+    from dexscreener_screener.cli import cmd_prune
+
+    # Test on empty DB
+    empty_db = "test_prune_empty.sqlite"
+    if Path(empty_db).exists():
+        Path(empty_db).unlink()
+    Database(empty_db).close()
+    class EmptyArgs:
+        db = empty_db
+        max_age_hours = 24
+        dry_run = True
+        vacuum = False
+    if cmd_prune(EmptyArgs()) != 0:
+        print("  FAIL: prune --dry-run on empty DB returned non-zero")
+        Path(empty_db).unlink(missing_ok=True)
+        return False
+    Path(empty_db).unlink(missing_ok=True)
+
+    # Test on filled DB (from smoke_db_and_collect)
+    if not Path(TEST_DB).exists():
+        smoke_db_and_collect()
+    class Args:
+        db = TEST_DB
+        max_age_hours = 24
+        dry_run = True
+        vacuum = False
+    if cmd_prune(Args()) != 0:
+        print("  FAIL: prune --dry-run on filled DB returned non-zero")
+        return False
+    print("  OK: prune --dry-run completed (empty + filled)")
+    return True
+
+
+def smoke_prune_real() -> bool:
+    """Real prune_by_pair_age and verify no old pairs remain."""
+    print("Smoke: prune_by_pair_age real + verify ...")
+    import sqlite3
+
+    if not Path(TEST_DB).exists():
+        smoke_db_and_collect()
+
+    # Insert an old pair (25 hours ago) with snapshot and tokens
+    now_ms = int(__import__("time").time() * 1000)
+    old_ms = now_ms - int(25 * 3600 * 1000)
+    db = Database(TEST_DB)
+    cur = db._conn.cursor()
+    cur.execute("SELECT pair_address, base_address, quote_address FROM pairs LIMIT 1")
+    row = cur.fetchone()
+    old_pair = "OLD_PAIR_" + str(old_ms)
+    old_base = "OLD_BASE_" + str(old_ms)[:20]
+    old_quote = "OLD_QUOTE_" + str(old_ms)[:20]
+    if row:
+        old_base = row["base_address"]
+        old_quote = row["quote_address"]
+    cur.execute(
+        "INSERT OR REPLACE INTO pairs (pair_address, pair_created_at_ms, base_address, quote_address) VALUES (?, ?, ?, ?)",
+        (old_pair, old_ms, old_base, old_quote),
+    )
+    cur.execute(
+        "INSERT INTO snapshots (pair_address, snapshot_ts, pair_created_at_ms) VALUES (?, ?, ?)",
+        (old_pair, now_ms, old_ms),
+    )
+    cur.execute("INSERT OR IGNORE INTO tokens (address, chain_id, symbol, name) VALUES (?, 'solana', 'OLD', 'Old')", (old_base,))
+    cur.execute("INSERT OR IGNORE INTO tokens (address, chain_id, symbol, name) VALUES (?, 'solana', 'OLD', 'Old')", (old_quote,))
+    db._conn.commit()
+    db.close()
+
+    db = Database(TEST_DB)
+    s_del, p_del, t_del = db.prune_by_pair_age(max_age_hours=24, dry_run=False, vacuum=False)
+    db.close()
+
+    conn = sqlite3.connect(TEST_DB)
+    cur = conn.cursor()
+    cutoff_ms = int((__import__("time").time() - 24 * 3600) * 1000)
+    cur.execute(
+        "SELECT COUNT(*) FROM pairs WHERE pair_created_at_ms < ? AND pair_created_at_ms IS NOT NULL AND pair_created_at_ms != 0",
+        (cutoff_ms,),
+    )
+    old_pairs = cur.fetchone()[0]
+    cur.execute(
+        """
+        SELECT COUNT(*) FROM tokens
+        WHERE NOT EXISTS (
+            SELECT 1 FROM pairs p
+            WHERE p.base_address = tokens.address OR p.quote_address = tokens.address
+        )
+        """
+    )
+    orphaned_tokens = cur.fetchone()[0]
+    conn.close()
+
+    if old_pairs != 0:
+        print("  FAIL: %s old pairs remaining after prune" % old_pairs)
+        return False
+    if orphaned_tokens != 0:
+        print("  FAIL: %s orphaned tokens remaining" % orphaned_tokens)
+        return False
+    print("  OK: prune_by_pair_age verified (deleted s=%s p=%s t=%s)" % (s_del, p_del, t_del))
+    return True
+
+
 def smoke_export() -> bool:
     """Export to JSON and CSV, check files and content."""
     print("Smoke: export JSON and CSV ...")
@@ -124,6 +228,8 @@ def main() -> int:
     ok = smoke_client_and_model() and ok
     ok = smoke_db_and_collect() and ok
     ok = smoke_export() and ok
+    ok = smoke_prune_dry_run() and ok
+    ok = smoke_prune_real() and ok
     for f in [TEST_DB, TEST_JSON, TEST_CSV]:
         if Path(f).exists():
             try:

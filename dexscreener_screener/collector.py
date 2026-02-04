@@ -103,6 +103,7 @@ class Collector:
                 self.db.upsert_token(snapshot.quote_token)
                 self.db.upsert_pair(snapshot)
                 self.db.insert_snapshot(snapshot)
+                self.db.update_dump_watchlist_for_snapshot(snapshot.pair_address)
                 processed += 1
             except Exception as e:
                 logger.warning("Failed to persist pair: %s", e)

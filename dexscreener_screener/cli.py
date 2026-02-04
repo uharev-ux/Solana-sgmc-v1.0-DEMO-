@@ -26,6 +26,41 @@ DEFAULT_DB = "dexscreener.sqlite"
 CHECK_PAIR_ADDRESS = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
 
 
+def cmd_self_check(args: argparse.Namespace) -> int:
+    """
+    Self-check DB invariants: only pairs <24h, no snapshots for old pairs, no orphan tokens.
+    Exit 0 if OK, 2 if FAIL. With --fix runs prune_by_pair_age(24) and re-checks.
+    """
+    db_path = args.db or DEFAULT_DB
+    if not Path(db_path).exists():
+        logger.error("Database not found: %s", db_path)
+        return 2
+    db = Database(db_path)
+    try:
+        old_pairs, old_snapshots, orphan_tokens = db.self_check_invariants()
+        ok = old_pairs == 0 and old_snapshots == 0 and orphan_tokens == 0
+
+        if ok:
+            print("SELF-CHECK OK")
+        else:
+            print("SELF-CHECK FAIL")
+        print("counts: old_pairs=%s, old_pairs_snapshots=%s, orphan_tokens=%s" % (old_pairs, old_snapshots, orphan_tokens))
+
+        if not ok and getattr(args, "fix", False):
+            s_cnt, p_cnt, t_cnt = db.prune_by_pair_age(max_age_hours=24, dry_run=False, vacuum=False)
+            print("FIX APPLIED: prune_by_pair_age(max_age_hours=24) => snapshots=%s pairs=%s tokens=%s" % (s_cnt, p_cnt, t_cnt))
+            old_pairs, old_snapshots, orphan_tokens = db.self_check_invariants()
+            print("counts: old_pairs=%s, old_pairs_snapshots=%s, orphan_tokens=%s" % (old_pairs, old_snapshots, orphan_tokens))
+            ok = old_pairs == 0 and old_snapshots == 0 and orphan_tokens == 0
+
+        db.close()
+        return 0 if ok else 2
+    except Exception as e:
+        logger.exception("self-check failed: %s", e)
+        db.close()
+        return 2
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """
     Self-check: API -> normalization -> SQLite -> read -> serialization.
@@ -114,6 +149,31 @@ def _row_to_export_dict(row: dict) -> dict:
     return {k: (v if v is not None else None) for k, v in row.items()}
 
 
+def cmd_prune(args: argparse.Namespace) -> int:
+    """Prune pairs older than max-age (by pair_created_at_ms) and orphan tokens."""
+    db_path = args.db or DEFAULT_DB
+    if not Path(db_path).exists():
+        logger.error("Database not found: %s", db_path)
+        return 1
+    db = Database(db_path)
+    try:
+        s_cnt, p_cnt, t_cnt = db.prune_by_pair_age(
+            max_age_hours=args.max_age_hours,
+            dry_run=args.dry_run,
+            vacuum=args.vacuum,
+        )
+    except Exception as e:
+        logger.error("Prune failed: %s", e)
+        db.close()
+        return 1
+    db.close()
+    if args.dry_run:
+        logger.info("prune (dry-run): would delete snapshots=%s pairs=%s tokens=%s", s_cnt, p_cnt, t_cnt)
+    else:
+        logger.info("prune: deleted snapshots=%s pairs=%s tokens=%s", s_cnt, p_cnt, t_cnt)
+    return 0
+
+
 def cmd_collect(args: argparse.Namespace) -> int:
     db_path = args.db or DEFAULT_DB
     db = Database(db_path)
@@ -138,6 +198,18 @@ def cmd_collect(args: argparse.Namespace) -> int:
     else:
         logger.error("Specify either --tokens or --pairs")
         return 1
+
+    if not getattr(args, "no_prune", False):
+        try:
+            max_h = getattr(args, "prune_max_age_hours", None) or 24
+            s_cnt, p_cnt, t_cnt = db.prune_by_pair_age(max_age_hours=max_h, dry_run=False, vacuum=False)
+            logger.info("auto-prune: snapshots=%s pairs=%s tokens=%s", s_cnt, p_cnt, t_cnt)
+            dw_cnt = db.prune_dump_watchlist(ttl_hours=3)
+            if dw_cnt:
+                logger.info("dump-watchlist prune: removed %s", dw_cnt)
+        except Exception as e:
+            logger.warning("auto-prune skipped: %s", e)
+
     db.close()
     logger.info("Done: %s pair(s) written, %s error(s)", processed, errors)
     return 0 if errors == 0 else 0
@@ -245,6 +317,16 @@ def cmd_collect_new(args: argparse.Namespace) -> int:
                 total_snapshots,
                 total_errors,
             )
+            if not getattr(args, "no_prune", False):
+                try:
+                    max_h = getattr(args, "prune_max_age_hours", 24)
+                    s_cnt, p_cnt, t_cnt = db.prune_by_pair_age(max_age_hours=max_h, dry_run=False, vacuum=False)
+                    logger.info("auto-prune: snapshots=%s pairs=%s tokens=%s", s_cnt, p_cnt, t_cnt)
+                    dw_cnt = db.prune_dump_watchlist(ttl_hours=3)
+                    if dw_cnt:
+                        logger.info("dump-watchlist prune: removed %s", dw_cnt)
+                except Exception as e:
+                    logger.warning("auto-prune skipped: %s", e)
         except Exception as e:
             cycle_errors = 1
             total_errors += 1
@@ -262,6 +344,76 @@ def cmd_collect_new(args: argparse.Namespace) -> int:
         total_snapshots,
         total_errors,
     )
+    return 0
+
+
+def cmd_dump_watchlist(args: argparse.Namespace) -> int:
+    """List dump watchlist entries (pair_address, state, drop_pct, peak_price, low_price, last_price, updated_at_ms, signal_price)."""
+    db_path = args.db or DEFAULT_DB
+    if not Path(db_path).exists():
+        logger.error("Database not found: %s", db_path)
+        return 1
+    db = Database(db_path)
+    state = getattr(args, "state", None)
+    limit = getattr(args, "limit", 50)
+    rows = list(db.iterate_dump_watchlist(state=state, limit=limit))
+    db.close()
+    if not rows:
+        print("No dump watchlist entries")
+        return 0
+    cols = ["pair_address", "state", "drop_pct", "peak_price", "low_price", "last_price", "updated_at_ms", "signal_price"]
+    fmt = "%-44s %-9s %7s %12s %12s %12s %14s %12s"
+    print(fmt % tuple(cols))
+    for r in rows:
+        print(
+            fmt
+            % (
+                (r.get("pair_address") or "")[:44],
+                r.get("state") or "",
+                "%.1f" % (r.get("drop_pct") or 0),
+                "%.6g" % (r.get("peak_price") or 0),
+                "%.6g" % (r.get("low_price") or 0),
+                "%.6g" % (r.get("last_price") or 0),
+                r.get("updated_at_ms") or "",
+                "%.6g" % (r.get("signal_price") or 0) if r.get("signal_price") is not None else "",
+            )
+        )
+    return 0
+
+
+def cmd_dump_watchlist_export(args: argparse.Namespace) -> int:
+    """Export dump_watchlist to JSON or CSV."""
+    db_path = args.db or DEFAULT_DB
+    if not Path(db_path).exists():
+        logger.error("Database not found: %s", db_path)
+        return 1
+    db = Database(db_path)
+    state = getattr(args, "state", None)
+    rows = list(db.iterate_dump_watchlist(state=state))
+    db.close()
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    export_format = (args.format or "json").lower()
+    if export_format == "json":
+        data = [_row_to_export_dict(r) for r in rows]
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    elif export_format == "csv":
+        import csv
+        if not rows:
+            with open(out_path, "w", encoding="utf-8", newline="") as f:
+                f.write("")
+        else:
+            headers = list(rows[0].keys())
+            with open(out_path, "w", encoding="utf-8", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=headers)
+                w.writeheader()
+                for r in rows:
+                    w.writerow({k: r.get(k) for k in headers})
+    else:
+        logger.error("Unknown format: %s (use json or csv)", args.format)
+        return 1
+    logger.info("Exported %s dump_watchlist row(s) to %s (%s)", len(rows), out_path, export_format)
     return 0
 
 
@@ -328,6 +480,8 @@ def main() -> int:
     collect_parser.add_argument("--timeout", type=float, default=10.0, help="HTTP timeout seconds")
     collect_parser.add_argument("--max-retries", type=int, default=4, help="Max HTTP retries")
     collect_parser.add_argument("--rate-limit-rps", type=float, default=3.0, help="Max requests per second")
+    collect_parser.add_argument("--no-prune", action="store_true", help="Disable auto-prune after successful collect")
+    collect_parser.add_argument("--prune-max-age-hours", type=float, default=24, help="Max age in hours for auto-prune (default 24)")
     collect_parser.set_defaults(func=cmd_collect)
 
     collect_new_parser = subparsers.add_parser(
@@ -351,7 +505,16 @@ def main() -> int:
     collect_new_parser.add_argument("--timeout", type=float, default=10.0, help="HTTP timeout seconds")
     collect_new_parser.add_argument("--max-retries", type=int, default=4, help="Max HTTP retries")
     collect_new_parser.add_argument("--rate-limit-rps", type=float, default=3.0, help="Max requests per second")
+    collect_new_parser.add_argument("--no-prune", action="store_true", help="Disable auto-prune after each cycle")
+    collect_new_parser.add_argument("--prune-max-age-hours", type=float, default=24, help="Max age in hours for auto-prune (default 24)")
     collect_new_parser.set_defaults(func=cmd_collect_new)
+
+    prune_parser = subparsers.add_parser("prune", help="Remove pairs older than N hours (by pair_created_at_ms) and orphan tokens")
+    prune_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path (default: %s)" % DEFAULT_DB)
+    prune_parser.add_argument("--max-age-hours", type=float, default=24, help="Delete pairs older than N hours (default 24)")
+    prune_parser.add_argument("--dry-run", action="store_true", help="Only report what would be deleted")
+    prune_parser.add_argument("--vacuum", action="store_true", help="Run VACUUM after pruning")
+    prune_parser.set_defaults(func=cmd_prune)
 
     export_parser = subparsers.add_parser("export", help="Export data from SQLite to JSON or CSV")
     export_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path (default: %s)" % DEFAULT_DB)
@@ -359,6 +522,27 @@ def main() -> int:
     export_parser.add_argument("--out", required=True, help="Output file path")
     export_parser.add_argument("--table", choices=["snapshots", "pairs", "tokens"], default="snapshots", help="Table to export")
     export_parser.set_defaults(func=cmd_export)
+
+    dump_watchlist_parser = subparsers.add_parser("dump-watchlist", help="View dump watchlist entries")
+    dump_watchlist_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path")
+    dump_watchlist_parser.add_argument("--state", choices=["DUMPING", "BOTTOMING", "SIGNAL"], help="Filter by state")
+    dump_watchlist_parser.add_argument("--limit", type=int, default=50, help="Max rows (default 50)")
+    dump_watchlist_parser.set_defaults(func=cmd_dump_watchlist)
+
+    dump_export_parser = subparsers.add_parser("dump-watchlist-export", help="Export dump_watchlist to JSON or CSV")
+    dump_export_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path")
+    dump_export_parser.add_argument("--format", choices=["json", "csv"], required=True, help="Output format")
+    dump_export_parser.add_argument("--out", required=True, help="Output file path")
+    dump_export_parser.add_argument("--state", choices=["DUMPING", "BOTTOMING", "SIGNAL"], help="Filter by state")
+    dump_export_parser.set_defaults(func=cmd_dump_watchlist_export)
+
+    self_check_parser = subparsers.add_parser(
+        "self-check",
+        help="Check DB invariants: only pairs <24h, no old-pair snapshots, no orphan tokens; exit 0=OK, 2=FAIL",
+    )
+    self_check_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path (default: %s)" % DEFAULT_DB)
+    self_check_parser.add_argument("--fix", action="store_true", help="If FAIL, run prune_by_pair_age(24) and re-check")
+    self_check_parser.set_defaults(func=cmd_self_check)
 
     check_parser = subparsers.add_parser("check", help="Self-check full cycle: API -> normalize -> SQLite -> read -> serialize")
     check_parser.add_argument("--timeout", type=float, default=15.0, help="HTTP timeout seconds")
