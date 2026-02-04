@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+import signal
 import sys
 import time
 from pathlib import Path
@@ -142,6 +143,128 @@ def cmd_collect(args: argparse.Namespace) -> int:
     return 0 if errors == 0 else 0
 
 
+def cmd_collect_new(args: argparse.Namespace) -> int:
+    """
+    Continuous collection of new pairs: token-profiles -> token addresses -> pairs -> dedup -> persist.
+    Exits only on SIGINT (Ctrl+C). Use --interval-sec 60 to respect token-profiles rate limit (60/min).
+    """
+    db_path = args.db or DEFAULT_DB
+    interval_sec = getattr(args, "interval_sec", 60)
+    if interval_sec < 1:
+        logger.error("--interval-sec must be >= 1")
+        return 1
+    limit_per_cycle = getattr(args, "limit_per_cycle", None)
+
+    db = Database(db_path)
+    client = DexScreenerClient(
+        timeout_sec=args.timeout,
+        max_retries=args.max_retries,
+        rate_limit_rps=args.rate_limit_rps,
+    )
+    collector = Collector(client, db)
+
+    shutdown = False
+
+    def _on_sigint(signum, frame):
+        nonlocal shutdown
+        if shutdown:
+            logger.warning("Second Ctrl+C, exiting immediately")
+            sys.exit(1)
+        shutdown = True
+        logger.info("SIGINT received, finishing current cycle then exiting")
+
+    signal.signal(signal.SIGINT, _on_sigint)
+
+    total_cycles = 0
+    total_candidates_tokens = 0
+    total_candidates_pairs = 0
+    total_new = 0
+    total_skipped = 0
+    total_processed = 0
+    total_snapshots = 0
+    total_errors = 0
+
+    cycle_num = 0
+    while not shutdown:
+        cycle_num += 1
+        cycle_candidates_tokens = 0
+        cycle_candidates_pairs = 0
+        cycle_new = 0
+        cycle_skipped = 0
+        cycle_processed = 0
+        cycle_snapshots = 0
+        cycle_errors = 0
+
+        try:
+            token_addresses = client.get_latest_token_profiles()
+            cycle_candidates_tokens = len(token_addresses)
+            if limit_per_cycle is not None and limit_per_cycle > 0:
+                token_addresses = token_addresses[:limit_per_cycle]
+
+            if not token_addresses:
+                logger.info("collect-new cycle %s: no token candidates from API", cycle_num)
+            else:
+                raw_pairs = client.get_pairs_by_token_addresses_batched(token_addresses)
+                cycle_candidates_pairs = len(raw_pairs)
+                known = db.get_known_pair_addresses()
+                processed, errors, skipped = collector.collect_from_raw_pairs(raw_pairs, known)
+                cycle_processed = processed
+                cycle_snapshots = processed
+                cycle_skipped = skipped
+                cycle_new = len(raw_pairs) - skipped
+                cycle_errors = errors
+
+            total_cycles = cycle_num
+            total_candidates_tokens += cycle_candidates_tokens
+            total_candidates_pairs += cycle_candidates_pairs
+            total_new += cycle_new
+            total_skipped += cycle_skipped
+            total_processed += cycle_processed
+            total_snapshots += cycle_snapshots
+            total_errors += cycle_errors
+
+            logger.info(
+                "collect-new cycle %s | candidates_tokens=%s candidates_pairs=%s new=%s skipped=%s processed=%s snapshots=%s errors=%s",
+                cycle_num,
+                cycle_candidates_tokens,
+                cycle_candidates_pairs,
+                cycle_new,
+                cycle_skipped,
+                cycle_processed,
+                cycle_snapshots,
+                cycle_errors,
+            )
+            logger.info(
+                "collect-new totals | cycles=%s candidates_tokens=%s candidates_pairs=%s new=%s skipped=%s processed=%s snapshots=%s errors=%s",
+                total_cycles,
+                total_candidates_tokens,
+                total_candidates_pairs,
+                total_new,
+                total_skipped,
+                total_processed,
+                total_snapshots,
+                total_errors,
+            )
+        except Exception as e:
+            cycle_errors = 1
+            total_errors += 1
+            logger.exception("collect-new cycle %s failed: %s", cycle_num, e)
+
+        if shutdown:
+            break
+        time.sleep(interval_sec)
+
+    db.close()
+    logger.info(
+        "collect-new stopped | total_cycles=%s total_processed=%s total_snapshots=%s total_errors=%s",
+        total_cycles,
+        total_processed,
+        total_snapshots,
+        total_errors,
+    )
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     db_path = args.db or DEFAULT_DB
     if not Path(db_path).exists():
@@ -206,6 +329,29 @@ def main() -> int:
     collect_parser.add_argument("--max-retries", type=int, default=4, help="Max HTTP retries")
     collect_parser.add_argument("--rate-limit-rps", type=float, default=3.0, help="Max requests per second")
     collect_parser.set_defaults(func=cmd_collect)
+
+    collect_new_parser = subparsers.add_parser(
+        "collect-new",
+        help="Continuous collection of new pairs from token-profiles (Solana); exit with Ctrl+C",
+    )
+    collect_new_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path (default: %s)" % DEFAULT_DB)
+    collect_new_parser.add_argument(
+        "--interval-sec",
+        type=float,
+        default=60.0,
+        help="Seconds between cycles (default 60; token-profiles rate limit 60/min)",
+    )
+    collect_new_parser.add_argument(
+        "--limit-per-cycle",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Max token candidates per cycle (optional)",
+    )
+    collect_new_parser.add_argument("--timeout", type=float, default=10.0, help="HTTP timeout seconds")
+    collect_new_parser.add_argument("--max-retries", type=int, default=4, help="Max HTTP retries")
+    collect_new_parser.add_argument("--rate-limit-rps", type=float, default=3.0, help="Max requests per second")
+    collect_new_parser.set_defaults(func=cmd_collect_new)
 
     export_parser = subparsers.add_parser("export", help="Export data from SQLite to JSON or CSV")
     export_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path (default: %s)" % DEFAULT_DB)

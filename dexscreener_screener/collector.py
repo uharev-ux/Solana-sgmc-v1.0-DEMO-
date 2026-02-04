@@ -71,6 +71,23 @@ class Collector:
         raw_pairs = self.client.get_pairs_by_pair_addresses(pair_addresses)
         return self._persist_pairs(raw_pairs)
 
+    def collect_from_raw_pairs(
+        self, raw_pairs: list[dict], known_pair_addresses: set[str]
+    ) -> tuple[int, int, int]:
+        """
+        Filter raw pairs to those not in known_pair_addresses, persist, return (processed, errors, skipped).
+        """
+        filtered = []
+        for raw in raw_pairs:
+            if not isinstance(raw, dict):
+                continue
+            addr = (raw.get("pairAddress") or raw.get("pair_address") or "").strip()
+            if addr and addr not in known_pair_addresses:
+                filtered.append(raw)
+        skipped = len(raw_pairs) - len(filtered)
+        processed, errors = self._persist_pairs(filtered)
+        return processed, errors, skipped
+
     def _persist_pairs(self, raw_pairs: list[dict]) -> tuple[int, int]:
         snapshot_ts = int(time.time() * 1000)
         processed = 0

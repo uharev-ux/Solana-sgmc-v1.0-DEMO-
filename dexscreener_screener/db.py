@@ -236,6 +236,12 @@ class Database:
         for row in cur:
             yield dict(row)
 
+    def get_known_pair_addresses(self) -> set[str]:
+        """Return set of pair_address from pairs table for deduplication."""
+        cur = self._conn.cursor()
+        cur.execute("SELECT pair_address FROM pairs")
+        return {row["pair_address"] for row in cur}
+
     def close(self) -> None:
         if self._conn:
             self._conn.close()

@@ -127,3 +127,30 @@ class DexScreenerClient:
             elif isinstance(data, dict) and "pairAddress" in data:
                 all_pairs.append(data)
         return all_pairs
+
+    def get_latest_token_profiles(self) -> list[str]:
+        """
+        Fetch latest token profiles. Returns Solana token addresses only.
+        GET /token-profiles/latest/v1. Rate limit: 60 req/min for this endpoint.
+        """
+        path = "/token-profiles/latest/v1"
+        data = self._request(path)
+        items: list[dict] = []
+        if isinstance(data, list):
+            items = [x for x in data if isinstance(x, dict)]
+        elif isinstance(data, dict):
+            for key in ("profiles", "tokenProfiles", "token_profiles", "data"):
+                if isinstance(data.get(key), list):
+                    items = [x for x in data[key] if isinstance(x, dict)]
+                    break
+        addresses: list[str] = []
+        for item in items:
+            chain = str(item.get("chainId") or item.get("chain_id") or "").strip().lower()
+            if chain != CHAIN_SOLANA:
+                continue
+            addr = (
+                str(item.get("tokenAddress") or item.get("token_address") or item.get("address") or "")
+            ).strip()
+            if addr:
+                addresses.append(addr)
+        return addresses
