@@ -1,4 +1,6 @@
-"""DexScreener public API client: timeouts, retries, rate-limit friendly."""
+"""DexScreener public API client: HTTP, timeouts, retries, rate-limit friendly."""
+
+from __future__ import annotations
 
 import logging
 import random
@@ -7,26 +9,24 @@ from typing import Any
 
 import httpx
 
-logger = logging.getLogger(__name__)
+from dexscreener_screener import config
+from dexscreener_screener.logging_setup import get_logger
 
-BASE_URL = "https://api.dexscreener.com"
-CHAIN_SOLANA = "solana"
-PAIRS_CHUNK_SIZE = 20
-TOKENS_CHUNK_SIZE = 30
+logger = get_logger(__name__)
 
 
 class DexScreenerClient:
-    """HTTP client for DexScreener public API with retries and rate limiting."""
+    """HTTP client for DexScreener public API. Only handles HTTP/API; no DB knowledge."""
 
     def __init__(
         self,
-        base_url: str = BASE_URL,
-        chain_id: str = CHAIN_SOLANA,
-        timeout_sec: float = 10.0,
-        max_retries: int = 4,
-        backoff_base: float = 0.5,
-        rate_limit_rps: float = 3.0,
-    ):
+        base_url: str = config.BASE_URL,
+        chain_id: str = config.CHAIN_SOLANA,
+        timeout_sec: float = config.DEFAULT_TIMEOUT_SEC,
+        max_retries: int = config.DEFAULT_MAX_RETRIES,
+        backoff_base: float = config.DEFAULT_BACKOFF_BASE,
+        rate_limit_rps: float = config.DEFAULT_RATE_LIMIT_RPS,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.chain_id = chain_id
         self.timeout_sec = timeout_sec
@@ -111,8 +111,8 @@ class DexScreenerClient:
             return []
         chain = self.chain_id
         all_pairs: list[dict] = []
-        for i in range(0, len(token_addresses), TOKENS_CHUNK_SIZE):
-            chunk = token_addresses[i : i + TOKENS_CHUNK_SIZE]
+        for i in range(0, len(token_addresses), config.TOKENS_CHUNK_SIZE):
+            chunk = token_addresses[i : i + config.TOKENS_CHUNK_SIZE]
             addrs_param = ",".join(chunk)
             path = f"/tokens/v1/{chain}/{addrs_param}"
             try:
@@ -146,7 +146,7 @@ class DexScreenerClient:
         addresses: list[str] = []
         for item in items:
             chain = str(item.get("chainId") or item.get("chain_id") or "").strip().lower()
-            if chain != CHAIN_SOLANA:
+            if chain != config.CHAIN_SOLANA:
                 continue
             addr = (
                 str(item.get("tokenAddress") or item.get("token_address") or item.get("address") or "")

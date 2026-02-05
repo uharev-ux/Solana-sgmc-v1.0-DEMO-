@@ -1,29 +1,22 @@
 """CLI: collect (tokens/pairs), export (json/csv), check (self-check)."""
 
 import argparse
+import csv
 import json
-import logging
 import signal
 import sys
 import time
 from pathlib import Path
 
+from dexscreener_screener import config
 from dexscreener_screener.client import DexScreenerClient
-from dexscreener_screener.collector import Collector, parse_addresses_input
-from dexscreener_screener.db import Database
+from dexscreener_screener.logging_setup import get_logger, setup_logging
 from dexscreener_screener.models import PairSnapshot, from_api_pair
+from dexscreener_screener.pipeline import Collector, parse_addresses_input
+from dexscreener_screener.storage import Database
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
-
-DEFAULT_DB = "dexscreener.sqlite"
-
-# Known Solana pair for self-check (from DexScreener tokens API)
-CHECK_PAIR_ADDRESS = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+setup_logging()
+logger = get_logger(__name__)
 
 
 def cmd_self_check(args: argparse.Namespace) -> int:
@@ -31,7 +24,7 @@ def cmd_self_check(args: argparse.Namespace) -> int:
     Self-check DB invariants: only pairs <24h, no snapshots for old pairs, no orphan tokens.
     Exit 0 if OK, 2 if FAIL. With --fix runs prune_by_pair_age(24) and re-checks.
     """
-    db_path = args.db or DEFAULT_DB
+    db_path = args.db or config.DEFAULT_DB
     if not Path(db_path).exists():
         logger.error("Database not found: %s", db_path)
         return 2
@@ -47,7 +40,7 @@ def cmd_self_check(args: argparse.Namespace) -> int:
         print("counts: old_pairs=%s, old_pairs_snapshots=%s, orphan_tokens=%s" % (old_pairs, old_snapshots, orphan_tokens))
 
         if not ok and getattr(args, "fix", False):
-            s_cnt, p_cnt, t_cnt = db.prune_by_pair_age(max_age_hours=24, dry_run=False, vacuum=False)
+            s_cnt, p_cnt, t_cnt = db.prune_by_pair_age(max_age_hours=config.SELF_CHECK_AGE_HOURS, dry_run=False, vacuum=False)
             print("FIX APPLIED: prune_by_pair_age(max_age_hours=24) => snapshots=%s pairs=%s tokens=%s" % (s_cnt, p_cnt, t_cnt))
             old_pairs, old_snapshots, orphan_tokens = db.self_check_invariants()
             print("counts: old_pairs=%s, old_pairs_snapshots=%s, orphan_tokens=%s" % (old_pairs, old_snapshots, orphan_tokens))
@@ -68,14 +61,17 @@ def cmd_check(args: argparse.Namespace) -> int:
     """
     logger.info("Check: starting full-cycle smoke (API -> normalize -> SQLite -> read -> serialize)")
 
-    # 1) API
+    timeout_sec = getattr(args, "timeout", config.CHECK_TIMEOUT_SEC)
+    max_retries = getattr(args, "max_retries", config.CHECK_MAX_RETRIES)
+    rate_limit_rps = getattr(args, "rate_limit_rps", config.CHECK_RATE_LIMIT_RPS)
+
     logger.info("Check: calling DexScreener API for one pair")
     client = DexScreenerClient(
-        timeout_sec=getattr(args, "timeout", 15.0),
-        max_retries=getattr(args, "max_retries", 2),
-        rate_limit_rps=getattr(args, "rate_limit_rps", 2.0),
+        timeout_sec=timeout_sec,
+        max_retries=max_retries,
+        rate_limit_rps=rate_limit_rps,
     )
-    raw_pairs = client.get_pairs_by_pair_addresses([CHECK_PAIR_ADDRESS])
+    raw_pairs = client.get_pairs_by_pair_addresses([config.CHECK_PAIR_ADDRESS])
     if not raw_pairs:
         logger.error("Check: API returned no pairs")
         return 1
@@ -85,7 +81,6 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
     logger.info("Check: API OK, pair_address=%s...", pair_dict.get("pairAddress", "")[:20])
 
-    # 2) Normalization
     logger.info("Check: normalizing to PairSnapshot")
     snapshot_ts = int(time.time() * 1000)
     try:
@@ -98,7 +93,6 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
     logger.info("Check: normalization OK, pair_address=%s", snapshot.pair_address[:20] + "...")
 
-    # 3) SQLite write (in-memory)
     logger.info("Check: writing to SQLite")
     db = Database(":memory:")
     try:
@@ -112,7 +106,6 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
     logger.info("Check: SQLite write OK")
 
-    # 4) Read back
     logger.info("Check: reading from SQLite")
     try:
         rows = list(db.iterate_snapshots())
@@ -128,7 +121,6 @@ def cmd_check(args: argparse.Namespace) -> int:
     db.close()
     logger.info("Check: read OK, %s row(s)", len(rows))
 
-    # 5) Basic serialization
     logger.info("Check: basic JSON serialization")
     try:
         payload = json.dumps(row, default=str, ensure_ascii=False)
@@ -151,7 +143,7 @@ def _row_to_export_dict(row: dict) -> dict:
 
 def cmd_prune(args: argparse.Namespace) -> int:
     """Prune pairs older than max-age (by pair_created_at_ms) and orphan tokens."""
-    db_path = args.db or DEFAULT_DB
+    db_path = args.db or config.DEFAULT_DB
     if not Path(db_path).exists():
         logger.error("Database not found: %s", db_path)
         return 1
@@ -175,7 +167,8 @@ def cmd_prune(args: argparse.Namespace) -> int:
 
 
 def cmd_collect(args: argparse.Namespace) -> int:
-    db_path = args.db or DEFAULT_DB
+    """Collect pairs by --tokens or --pairs, then optional auto-prune."""
+    db_path = args.db or config.DEFAULT_DB
     db = Database(db_path)
     client = DexScreenerClient(
         timeout_sec=args.timeout,
@@ -201,10 +194,10 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
     if not getattr(args, "no_prune", False):
         try:
-            max_h = getattr(args, "prune_max_age_hours", None) or 24
+            max_h = getattr(args, "prune_max_age_hours", None) or config.DEFAULT_PRUNE_MAX_AGE_HOURS
             s_cnt, p_cnt, t_cnt = db.prune_by_pair_age(max_age_hours=max_h, dry_run=False, vacuum=False)
             logger.info("auto-prune: snapshots=%s pairs=%s tokens=%s", s_cnt, p_cnt, t_cnt)
-            dw_cnt = db.prune_dump_watchlist(ttl_hours=3)
+            dw_cnt = db.prune_dump_watchlist(ttl_hours=config.DUMP_WATCHLIST_TTL_HOURS)
             if dw_cnt:
                 logger.info("dump-watchlist prune: removed %s", dw_cnt)
         except Exception as e:
@@ -220,8 +213,8 @@ def cmd_collect_new(args: argparse.Namespace) -> int:
     Continuous collection of new pairs: token-profiles -> token addresses -> pairs -> dedup -> persist.
     Exits only on SIGINT (Ctrl+C). Use --interval-sec 60 to respect token-profiles rate limit (60/min).
     """
-    db_path = args.db or DEFAULT_DB
-    interval_sec = getattr(args, "interval_sec", 60)
+    db_path = args.db or config.DEFAULT_DB
+    interval_sec = getattr(args, "interval_sec", config.COLLECT_NEW_INTERVAL_SEC)
     if interval_sec < 1:
         logger.error("--interval-sec must be >= 1")
         return 1
@@ -319,10 +312,10 @@ def cmd_collect_new(args: argparse.Namespace) -> int:
             )
             if not getattr(args, "no_prune", False):
                 try:
-                    max_h = getattr(args, "prune_max_age_hours", 24)
+                    max_h = getattr(args, "prune_max_age_hours", config.DEFAULT_PRUNE_MAX_AGE_HOURS)
                     s_cnt, p_cnt, t_cnt = db.prune_by_pair_age(max_age_hours=max_h, dry_run=False, vacuum=False)
                     logger.info("auto-prune: snapshots=%s pairs=%s tokens=%s", s_cnt, p_cnt, t_cnt)
-                    dw_cnt = db.prune_dump_watchlist(ttl_hours=3)
+                    dw_cnt = db.prune_dump_watchlist(ttl_hours=config.DUMP_WATCHLIST_TTL_HOURS)
                     if dw_cnt:
                         logger.info("dump-watchlist prune: removed %s", dw_cnt)
                 except Exception as e:
@@ -349,7 +342,7 @@ def cmd_collect_new(args: argparse.Namespace) -> int:
 
 def cmd_dump_watchlist(args: argparse.Namespace) -> int:
     """List dump watchlist entries (pair_address, state, drop_pct, peak_price, low_price, last_price, updated_at_ms, signal_price)."""
-    db_path = args.db or DEFAULT_DB
+    db_path = args.db or config.DEFAULT_DB
     if not Path(db_path).exists():
         logger.error("Database not found: %s", db_path)
         return 1
@@ -383,7 +376,7 @@ def cmd_dump_watchlist(args: argparse.Namespace) -> int:
 
 def cmd_dump_watchlist_export(args: argparse.Namespace) -> int:
     """Export dump_watchlist to JSON or CSV."""
-    db_path = args.db or DEFAULT_DB
+    db_path = args.db or config.DEFAULT_DB
     if not Path(db_path).exists():
         logger.error("Database not found: %s", db_path)
         return 1
@@ -399,7 +392,6 @@ def cmd_dump_watchlist_export(args: argparse.Namespace) -> int:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     elif export_format == "csv":
-        import csv
         if not rows:
             with open(out_path, "w", encoding="utf-8", newline="") as f:
                 f.write("")
@@ -418,7 +410,8 @@ def cmd_dump_watchlist_export(args: argparse.Namespace) -> int:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    db_path = args.db or DEFAULT_DB
+    """Export snapshots/pairs/tokens from DB to JSON or CSV."""
+    db_path = args.db or config.DEFAULT_DB
     if not Path(db_path).exists():
         logger.error("Database not found: %s", db_path)
         return 1
@@ -444,7 +437,6 @@ def cmd_export(args: argparse.Namespace) -> int:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     elif export_format == "csv":
-        import csv
         if not rows:
             logger.warning("No rows to export")
             with open(out_path, "w", encoding="utf-8", newline="") as f:
@@ -467,6 +459,10 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    """
+    CLI entrypoint: parse args, dispatch to command handlers.
+    Commands: collect, collect-new, prune, export, dump-watchlist, dump-watchlist-export, self-check, check.
+    """
     parser = argparse.ArgumentParser(
         prog="dexscreener_screener",
         description="DexScreener Screener v1: collect Solana pair data and export to JSON/CSV.",
@@ -474,25 +470,25 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     collect_parser = subparsers.add_parser("collect", help="Collect pairs from DexScreener API")
-    collect_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path (default: %s)" % DEFAULT_DB)
+    collect_parser.add_argument("--db", default=config.DEFAULT_DB, help="SQLite database path (default: %s)" % config.DEFAULT_DB)
     collect_parser.add_argument("--tokens", metavar="FILE_OR_CSV", help="Token addresses file or comma-separated list")
     collect_parser.add_argument("--pairs", metavar="FILE_OR_CSV", help="Pair addresses file or comma-separated list")
-    collect_parser.add_argument("--timeout", type=float, default=10.0, help="HTTP timeout seconds")
-    collect_parser.add_argument("--max-retries", type=int, default=4, help="Max HTTP retries")
-    collect_parser.add_argument("--rate-limit-rps", type=float, default=3.0, help="Max requests per second")
+    collect_parser.add_argument("--timeout", type=float, default=config.DEFAULT_TIMEOUT_SEC, help="HTTP timeout seconds")
+    collect_parser.add_argument("--max-retries", type=int, default=config.DEFAULT_MAX_RETRIES, help="Max HTTP retries")
+    collect_parser.add_argument("--rate-limit-rps", type=float, default=config.DEFAULT_RATE_LIMIT_RPS, help="Max requests per second")
     collect_parser.add_argument("--no-prune", action="store_true", help="Disable auto-prune after successful collect")
-    collect_parser.add_argument("--prune-max-age-hours", type=float, default=24, help="Max age in hours for auto-prune (default 24)")
+    collect_parser.add_argument("--prune-max-age-hours", type=float, default=config.DEFAULT_PRUNE_MAX_AGE_HOURS, help="Max age in hours for auto-prune (default 24)")
     collect_parser.set_defaults(func=cmd_collect)
 
     collect_new_parser = subparsers.add_parser(
         "collect-new",
         help="Continuous collection of new pairs from token-profiles (Solana); exit with Ctrl+C",
     )
-    collect_new_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path (default: %s)" % DEFAULT_DB)
+    collect_new_parser.add_argument("--db", default=config.DEFAULT_DB, help="SQLite database path (default: %s)" % config.DEFAULT_DB)
     collect_new_parser.add_argument(
         "--interval-sec",
         type=float,
-        default=60.0,
+        default=config.COLLECT_NEW_INTERVAL_SEC,
         help="Seconds between cycles (default 60; token-profiles rate limit 60/min)",
     )
     collect_new_parser.add_argument(
@@ -502,35 +498,35 @@ def main() -> int:
         metavar="N",
         help="Max token candidates per cycle (optional)",
     )
-    collect_new_parser.add_argument("--timeout", type=float, default=10.0, help="HTTP timeout seconds")
-    collect_new_parser.add_argument("--max-retries", type=int, default=4, help="Max HTTP retries")
-    collect_new_parser.add_argument("--rate-limit-rps", type=float, default=3.0, help="Max requests per second")
+    collect_new_parser.add_argument("--timeout", type=float, default=config.DEFAULT_TIMEOUT_SEC, help="HTTP timeout seconds")
+    collect_new_parser.add_argument("--max-retries", type=int, default=config.DEFAULT_MAX_RETRIES, help="Max HTTP retries")
+    collect_new_parser.add_argument("--rate-limit-rps", type=float, default=config.DEFAULT_RATE_LIMIT_RPS, help="Max requests per second")
     collect_new_parser.add_argument("--no-prune", action="store_true", help="Disable auto-prune after each cycle")
-    collect_new_parser.add_argument("--prune-max-age-hours", type=float, default=24, help="Max age in hours for auto-prune (default 24)")
+    collect_new_parser.add_argument("--prune-max-age-hours", type=float, default=config.DEFAULT_PRUNE_MAX_AGE_HOURS, help="Max age in hours for auto-prune (default 24)")
     collect_new_parser.set_defaults(func=cmd_collect_new)
 
     prune_parser = subparsers.add_parser("prune", help="Remove pairs older than N hours (by pair_created_at_ms) and orphan tokens")
-    prune_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path (default: %s)" % DEFAULT_DB)
-    prune_parser.add_argument("--max-age-hours", type=float, default=24, help="Delete pairs older than N hours (default 24)")
+    prune_parser.add_argument("--db", default=config.DEFAULT_DB, help="SQLite database path (default: %s)" % config.DEFAULT_DB)
+    prune_parser.add_argument("--max-age-hours", type=float, default=config.DEFAULT_PRUNE_MAX_AGE_HOURS, help="Delete pairs older than N hours (default 24)")
     prune_parser.add_argument("--dry-run", action="store_true", help="Only report what would be deleted")
     prune_parser.add_argument("--vacuum", action="store_true", help="Run VACUUM after pruning")
     prune_parser.set_defaults(func=cmd_prune)
 
     export_parser = subparsers.add_parser("export", help="Export data from SQLite to JSON or CSV")
-    export_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path (default: %s)" % DEFAULT_DB)
+    export_parser.add_argument("--db", default=config.DEFAULT_DB, help="SQLite database path (default: %s)" % config.DEFAULT_DB)
     export_parser.add_argument("--format", choices=["json", "csv"], required=True, help="Output format")
     export_parser.add_argument("--out", required=True, help="Output file path")
     export_parser.add_argument("--table", choices=["snapshots", "pairs", "tokens"], default="snapshots", help="Table to export")
     export_parser.set_defaults(func=cmd_export)
 
     dump_watchlist_parser = subparsers.add_parser("dump-watchlist", help="View dump watchlist entries")
-    dump_watchlist_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path")
+    dump_watchlist_parser.add_argument("--db", default=config.DEFAULT_DB, help="SQLite database path")
     dump_watchlist_parser.add_argument("--state", choices=["DUMPING", "BOTTOMING", "SIGNAL"], help="Filter by state")
     dump_watchlist_parser.add_argument("--limit", type=int, default=50, help="Max rows (default 50)")
     dump_watchlist_parser.set_defaults(func=cmd_dump_watchlist)
 
     dump_export_parser = subparsers.add_parser("dump-watchlist-export", help="Export dump_watchlist to JSON or CSV")
-    dump_export_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path")
+    dump_export_parser.add_argument("--db", default=config.DEFAULT_DB, help="SQLite database path")
     dump_export_parser.add_argument("--format", choices=["json", "csv"], required=True, help="Output format")
     dump_export_parser.add_argument("--out", required=True, help="Output file path")
     dump_export_parser.add_argument("--state", choices=["DUMPING", "BOTTOMING", "SIGNAL"], help="Filter by state")
@@ -540,14 +536,14 @@ def main() -> int:
         "self-check",
         help="Check DB invariants: only pairs <24h, no old-pair snapshots, no orphan tokens; exit 0=OK, 2=FAIL",
     )
-    self_check_parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path (default: %s)" % DEFAULT_DB)
+    self_check_parser.add_argument("--db", default=config.DEFAULT_DB, help="SQLite database path (default: %s)" % config.DEFAULT_DB)
     self_check_parser.add_argument("--fix", action="store_true", help="If FAIL, run prune_by_pair_age(24) and re-check")
     self_check_parser.set_defaults(func=cmd_self_check)
 
     check_parser = subparsers.add_parser("check", help="Self-check full cycle: API -> normalize -> SQLite -> read -> serialize")
-    check_parser.add_argument("--timeout", type=float, default=15.0, help="HTTP timeout seconds")
-    check_parser.add_argument("--max-retries", type=int, default=2, help="Max HTTP retries")
-    check_parser.add_argument("--rate-limit-rps", type=float, default=2.0, help="Max requests per second")
+    check_parser.add_argument("--timeout", type=float, default=config.CHECK_TIMEOUT_SEC, help="HTTP timeout seconds")
+    check_parser.add_argument("--max-retries", type=int, default=config.CHECK_MAX_RETRIES, help="Max HTTP retries")
+    check_parser.add_argument("--rate-limit-rps", type=float, default=config.CHECK_RATE_LIMIT_RPS, help="Max requests per second")
     check_parser.set_defaults(func=cmd_check)
 
     args = parser.parse_args()

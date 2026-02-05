@@ -1,4 +1,4 @@
-"""SQLite storage: tokens, pairs (latest), snapshots (history)."""
+"""SQLite storage: tokens, pairs (latest), snapshots (history). Only DB logic; no API knowledge."""
 
 from __future__ import annotations
 
@@ -7,66 +7,10 @@ import time
 from pathlib import Path
 from typing import Any, Generator, Sequence
 
+from dexscreener_screener import config
 from dexscreener_screener.models import PairSnapshot, TokenInfo
 
-# Column name candidates for auto-detect in prune()
-TS_CANDIDATES = [
-    "snapshot_ts", "ts", "timestamp", "created_at", "captured_at", "observed_at",
-    "created_at_ms", "timestamp_ms",
-]
-SNAP_PAIR_REF_CANDIDATES = ["pair_address", "pair", "pairAddress", "pair_id", "pairId"]
-PAIRS_PAIR_CANDIDATES = ["pair_address", "pair", "address", "pairAddress"]
-PAIRS_BASE_CANDIDATES = [
-    "base_address", "base_token_address", "base_mint",
-    "baseTokenAddress", "baseTokenMint", "baseToken",
-]
-PAIRS_QUOTE_CANDIDATES = [
-    "quote_address", "quote_token_address", "quote_mint",
-    "quoteTokenAddress", "quoteTokenMint", "quoteToken",
-]
-TOKENS_ADDR_CANDIDATES = ["address", "token_address", "mint", "token_mint"]
-
-
-def _pragma_table_info(conn: sqlite3.Connection, table: str) -> list[tuple[str, str]]:
-    """Return (name, type) for each column in table."""
-    cur = conn.execute(f"PRAGMA table_info({table})")
-    return [(r[1], (r[2] or "").upper()) for r in cur.fetchall()]
-
-
-def _pick(cols: Sequence[tuple[str, str]], candidates: Sequence[str]) -> str | None:
-    """Return first matching column name (preserving schema case) or None."""
-    m = {name.lower(): name for name, _ in cols}
-    for c in candidates:
-        if c.lower() in m:
-            return m[c.lower()]
-    return None
-
-
-def _must_pick(
-    conn: sqlite3.Connection,
-    table: str,
-    candidates: Sequence[str],
-    what: str,
-) -> str:
-    """Return matching column or raise ValueError with helpful message."""
-    cols = _pragma_table_info(conn, table)
-    picked = _pick(cols, candidates)
-    if not picked:
-        raise ValueError(
-            f"{what}: table '{table}' has no recognized column. "
-            f"Checked: {list(candidates)}. Found: {[c[0] for c in cols]}"
-        )
-    return picked
-
-
-def _detect_ms_or_sec(conn: sqlite3.Connection, table: str, ts_col: str) -> int:
-    """Return 1000 if column values are ms, else 1 (seconds)."""
-    row = conn.execute(f"SELECT MAX({ts_col}) FROM {table}").fetchone()
-    mx = row[0] if row else None
-    if not mx:
-        return 1
-    return 1000 if mx > 10**12 else 1
-
+# Schema and column definitions (DB-specific)
 SCHEMA_TOKENS = """
 CREATE TABLE IF NOT EXISTS tokens (
     address TEXT PRIMARY KEY,
@@ -192,12 +136,6 @@ CREATE TABLE IF NOT EXISTS dump_watchlist (
 IDX_DUMP_WATCHLIST_STATE = "CREATE INDEX IF NOT EXISTS idx_dump_watchlist_state ON dump_watchlist(state);"
 IDX_DUMP_WATCHLIST_UPDATED = "CREATE INDEX IF NOT EXISTS idx_dump_watchlist_updated ON dump_watchlist(updated_at_ms);"
 
-# Dump watchlist constants
-DROP_THRESHOLD = 50.0
-LIQ_MIN = 10000.0
-VOL_M5_MIN = 500.0
-SELLS_MIN = 5
-
 PAIRS_COLUMNS = [
     "pair_address", "chain_id", "dex_id", "url",
     "base_address", "base_symbol", "base_name",
@@ -214,7 +152,49 @@ PAIRS_COLUMNS = [
 SNAPSHOTS_COLUMNS = ["pair_address"] + PAIRS_COLUMNS[1:]
 
 
+def _pragma_table_info(conn: sqlite3.Connection, table: str) -> list[tuple[str, str]]:
+    """Return (name, type) for each column in table."""
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return [(r[1], (r[2] or "").upper()) for r in cur.fetchall()]
+
+
+def _pick(cols: Sequence[tuple[str, str]], candidates: Sequence[str]) -> str | None:
+    """Return first matching column name (preserving schema case) or None."""
+    m = {name.lower(): name for name, _ in cols}
+    for c in candidates:
+        if c.lower() in m:
+            return m[c.lower()]
+    return None
+
+
+def _must_pick(
+    conn: sqlite3.Connection,
+    table: str,
+    candidates: Sequence[str],
+    what: str,
+) -> str:
+    """Return matching column or raise ValueError with helpful message."""
+    cols = _pragma_table_info(conn, table)
+    picked = _pick(cols, candidates)
+    if not picked:
+        raise ValueError(
+            f"{what}: table '{table}' has no recognized column. "
+            f"Checked: {list(candidates)}. Found: {[c[0] for c in cols]}"
+        )
+    return picked
+
+
+def _detect_ms_or_sec(conn: sqlite3.Connection, table: str, ts_col: str) -> int:
+    """Return 1000 if column values are ms, else 1 (seconds)."""
+    row = conn.execute(f"SELECT MAX({ts_col}) FROM {table}").fetchone()
+    mx = row[0] if row else None
+    if not mx:
+        return 1
+    return 1000 if mx > 10**12 else 1
+
+
 def _snapshot_to_row(s: PairSnapshot) -> tuple:
+    """Convert PairSnapshot to row tuple for insert."""
     return (
         s.pair_address,
         s.chain_id,
@@ -255,7 +235,7 @@ def _snapshot_to_row(s: PairSnapshot) -> tuple:
 
 
 class Database:
-    """SQLite wrapper for tokens, pairs, and snapshots."""
+    """SQLite wrapper for tokens, pairs, snapshots, dump_watchlist. No API knowledge."""
 
     def __init__(self, db_path: str) -> None:
         self.db_path = Path(db_path)
@@ -268,6 +248,7 @@ class Database:
         self._conn.row_factory = sqlite3.Row
 
     def init_schema(self) -> None:
+        """Create tables and indexes if missing."""
         cur = self._conn.cursor()
         cur.executescript(
             SCHEMA_TOKENS + SCHEMA_PAIRS + SCHEMA_SNAPSHOTS
@@ -277,14 +258,16 @@ class Database:
         self._conn.commit()
 
     def upsert_token(self, token: TokenInfo) -> None:
+        """Insert or replace token by address."""
         cur = self._conn.cursor()
         cur.execute(
             "INSERT OR REPLACE INTO tokens (address, chain_id, symbol, name) VALUES (?, ?, ?, ?)",
-            (token.address, "solana", token.symbol, token.name),
+            (token.address, config.CHAIN_SOLANA, token.symbol, token.name),
         )
         self._conn.commit()
 
     def upsert_pair(self, snapshot: PairSnapshot) -> None:
+        """Insert or replace pair by pair_address."""
         cur = self._conn.cursor()
         placeholders = ",".join("?" * len(PAIRS_COLUMNS))
         cur.execute(
@@ -294,6 +277,7 @@ class Database:
         self._conn.commit()
 
     def insert_snapshot(self, snapshot: PairSnapshot) -> None:
+        """Append one snapshot row (history)."""
         cur = self._conn.cursor()
         placeholders = ",".join("?" * len(SNAPSHOTS_COLUMNS))
         cur.execute(
@@ -327,12 +311,14 @@ class Database:
             yield dict(row)
 
     def iterate_pairs(self) -> Generator[dict[str, Any], None, None]:
+        """Yield all pairs as dicts."""
         cur = self._conn.cursor()
         cur.execute("SELECT * FROM pairs")
         for row in cur:
             yield dict(row)
 
     def iterate_tokens(self) -> Generator[dict[str, Any], None, None]:
+        """Yield all tokens as dicts."""
         cur = self._conn.cursor()
         cur.execute("SELECT * FROM tokens")
         for row in cur:
@@ -372,33 +358,33 @@ class Database:
 
     def prune(
         self,
-        max_age_hours: float = 24,
+        max_age_hours: float = config.DEFAULT_PRUNE_MAX_AGE_HOURS,
         ts_column: str | None = None,
         dry_run: bool = False,
         vacuum: bool = False,
     ) -> tuple[int, int, int]:
         """
         Remove old snapshots, orphaned pairs, orphaned tokens.
-        All in one transaction. Returns (snapshots_deleted, pairs_deleted, tokens_deleted).
-        Uses NOT EXISTS (never NOT IN). Auto-detects timestamp column and ms/sec.
+        Returns (snapshots_deleted, pairs_deleted, tokens_deleted).
+        Uses NOT EXISTS; auto-detects timestamp column and ms/sec.
         """
         snap_ts_col = ts_column or _must_pick(
-            self._conn, "snapshots", TS_CANDIDATES, "Timestamp"
+            self._conn, "snapshots", config.TS_CANDIDATES, "Timestamp"
         )
         snap_pair_ref_col = _must_pick(
-            self._conn, "snapshots", SNAP_PAIR_REF_CANDIDATES, "Snapshot pair ref"
+            self._conn, "snapshots", config.SNAP_PAIR_REF_CANDIDATES, "Snapshot pair ref"
         )
         pairs_pair_col = _must_pick(
-            self._conn, "pairs", PAIRS_PAIR_CANDIDATES, "Pairs address"
+            self._conn, "pairs", config.PAIRS_PAIR_CANDIDATES, "Pairs address"
         )
         pairs_base_col = _must_pick(
-            self._conn, "pairs", PAIRS_BASE_CANDIDATES, "Pairs base token"
+            self._conn, "pairs", config.PAIRS_BASE_CANDIDATES, "Pairs base token"
         )
         pairs_quote_col = _must_pick(
-            self._conn, "pairs", PAIRS_QUOTE_CANDIDATES, "Pairs quote token"
+            self._conn, "pairs", config.PAIRS_QUOTE_CANDIDATES, "Pairs quote token"
         )
         tokens_addr_col = _must_pick(
-            self._conn, "tokens", TOKENS_ADDR_CANDIDATES, "Tokens address"
+            self._conn, "tokens", config.TOKENS_ADDR_CANDIDATES, "Tokens address"
         )
 
         unit = _detect_ms_or_sec(self._conn, "snapshots", snap_ts_col)
@@ -488,14 +474,12 @@ class Database:
 
     def prune_by_pair_age(
         self,
-        max_age_hours: float = 24,
+        max_age_hours: float = config.DEFAULT_PRUNE_MAX_AGE_HOURS,
         dry_run: bool = False,
         vacuum: bool = False,
     ) -> tuple[int, int, int]:
         """
         Remove pairs older than max_age_hours (by pair_created_at_ms) and orphan tokens.
-        Pairs with pair_created_at_ms IS NULL or 0 are NOT deleted.
-        Order: snapshots -> pairs -> tokens. Uses NOT EXISTS only. Single transaction.
         Returns (snapshots_deleted, pairs_deleted, tokens_deleted).
         """
         cutoff_ms = int((time.time() - max_age_hours * 3600) * 1000)
@@ -505,7 +489,6 @@ class Database:
             self._conn.execute("BEGIN IMMEDIATE")
 
         try:
-            # 1) Delete snapshots for pairs that are old (pair_created_at_ms < cutoff, not NULL, not 0)
             if dry_run:
                 s_cnt = cur.execute(
                     """
@@ -536,7 +519,6 @@ class Database:
                 )
                 s_cnt = cur.rowcount
 
-            # 2) Delete old pairs (pair_created_at_ms < cutoff, not NULL, not 0)
             if dry_run:
                 p_cnt = cur.execute(
                     """
@@ -559,7 +541,6 @@ class Database:
                 )
                 p_cnt = cur.rowcount
 
-            # 3) Delete orphan tokens (NOT EXISTS in any pair)
             if dry_run:
                 t_cnt = cur.execute(
                     """
@@ -602,19 +583,18 @@ class Database:
         """
         Run 3 invariant checks (should all be 0 if prune_by_pair_age keeps only pairs <24h).
         Returns (old_pairs, old_pairs_snapshots, orphan_tokens).
-        Uses current schema; no NOT IN.
         """
+        cutoff_ms = int((time.time() - config.SELF_CHECK_AGE_HOURS * 3600) * 1000)
         cur = self._conn.cursor()
-        # A) Old pairs (pair_created_at_ms < now - 24h)
         a = cur.execute(
             """
             SELECT COUNT(*) FROM pairs
             WHERE pair_created_at_ms IS NOT NULL
               AND pair_created_at_ms > 0
-              AND pair_created_at_ms < (CAST(strftime('%s','now') AS INTEGER) * 1000 - 24*3600*1000)
-            """
+              AND pair_created_at_ms < ?
+            """,
+            (cutoff_ms,),
         ).fetchone()[0]
-        # B) Snapshots belonging to old pairs
         b = cur.execute(
             """
             SELECT COUNT(*) FROM snapshots s
@@ -623,11 +603,11 @@ class Database:
               WHERE p.pair_address = s.pair_address
                 AND p.pair_created_at_ms IS NOT NULL
                 AND p.pair_created_at_ms > 0
-                AND p.pair_created_at_ms < (CAST(strftime('%s','now') AS INTEGER) * 1000 - 24*3600*1000)
+                AND p.pair_created_at_ms < ?
             )
-            """
+            """,
+            (cutoff_ms,),
         ).fetchone()[0]
-        # C) Orphan tokens (no pair references base or quote)
         c = cur.execute(
             """
             SELECT COUNT(*) FROM tokens t
@@ -650,14 +630,10 @@ class Database:
     def update_dump_watchlist_for_snapshot(self, pair_address: str) -> None:
         """
         Update dump watchlist for a pair: detect dump (>=50% from peak), track low, signal reversal.
-        Fix 1: peak_price/peak_ts from single query ORDER BY price_usd DESC, snapshot_ts DESC.
-        Fix 3: low_price updated BEFORE BOTTOMING/SIGNAL state checks.
-        Fix 4: NULL-safe prev_volume for SIGNAL.
-        Stability: existing entries are never removed due to drop_pct<50; only TTL/orphan prune.
+        Uses config thresholds: DROP_THRESHOLD, LIQ_MIN, VOL_M5_MIN, SELLS_MIN.
         """
         cur = self._conn.cursor()
 
-        # Last snapshot
         last_row = cur.execute(
             """
             SELECT price_usd, volume_m5, txns_m5_buys, txns_m5_sells, snapshot_ts
@@ -677,7 +653,6 @@ class Database:
         if last_price is None or last_price <= 0:
             return
 
-        # Fix 1: peak_price + peak_ts in one query
         peak_row = cur.execute(
             """
             SELECT price_usd, snapshot_ts
@@ -697,7 +672,6 @@ class Database:
 
         drop_pct = (peak_price - last_price) / peak_price * 100.0
 
-        # Liquidity from pairs
         pair_row = cur.execute(
             "SELECT liquidity_usd FROM pairs WHERE pair_address=?", (pair_address,)
         ).fetchone()
@@ -707,7 +681,6 @@ class Database:
 
         now_ms = int(time.time() * 1000)
 
-        # Two last snapshots for BOTTOMING/SIGNAL (fetch once)
         two_rows = cur.execute(
             """
             SELECT price_usd, txns_m5_buys, txns_m5_sells, volume_m5, snapshot_ts
@@ -716,21 +689,18 @@ class Database:
             (pair_address,),
         ).fetchall()
 
-        # Check if already in watchlist (stability: don't exit on drop_pct<50)
         existing = cur.execute(
             "SELECT pair_address, low_price, low_ts, state, signal_ts FROM dump_watchlist WHERE pair_address=?",
             (pair_address,),
         ).fetchone()
 
         if existing:
-            # Update existing: last_*, peak (if higher), low (if lower), drop_pct
             cur_row = dict(existing)
             low_price = float(cur_row["low_price"])
             low_ts = int(cur_row["low_ts"])
             state = cur_row["state"]
             signal_ts = cur_row["signal_ts"]
 
-            # Update peak if current peak is higher (from DB)
             cur.execute(
                 """
                 UPDATE dump_watchlist SET
@@ -742,7 +712,6 @@ class Database:
                 (now_ms, last_price, last_ts, drop_pct, volume_m5, buys_m5, sells_m5, peak_price, peak_ts, pair_address, peak_price),
             )
 
-            # Fix 3: Update low_price/low_ts BEFORE state machine
             if last_price < low_price:
                 low_price = last_price
                 low_ts = last_ts
@@ -761,8 +730,7 @@ class Database:
                 (now_ms, last_price, last_ts, drop_pct, volume_m5, buys_m5, sells_m5, pair_address),
             )
         else:
-            # New entry: only if dump conditions met (drop_pct>=50, liq>=10k, vol>=500, sells>=5)
-            if drop_pct < DROP_THRESHOLD or liq < LIQ_MIN or vol < VOL_M5_MIN or sells < SELLS_MIN:
+            if drop_pct < config.DROP_THRESHOLD or liq < config.LIQ_MIN or vol < config.VOL_M5_MIN or sells < config.SELLS_MIN:
                 return
 
             cur.execute(
@@ -786,7 +754,6 @@ class Database:
 
         self._conn.commit()
 
-        # Reload row for state machine
         row = cur.execute(
             "SELECT state, low_price, signal_ts FROM dump_watchlist WHERE pair_address=?",
             (pair_address,),
@@ -800,11 +767,9 @@ class Database:
         buys = int(buys_m5) if buys_m5 is not None else 0
         sells = int(sells_m5) if sells_m5 is not None else 0
 
-        # State machine: BOTTOMING, SIGNAL (only if not already SIGNAL with signal_ts set)
         if state == "SIGNAL" and signal_ts is not None:
             return
 
-        # BOTTOMING: need 2 last snapshots
         if state == "DUMPING" and len(two_rows) >= 2:
             threshold = low_price * 1.003
             last_snap = two_rows[0]
@@ -821,9 +786,8 @@ class Database:
                 state = "BOTTOMING"
                 self._conn.commit()
 
-        # SIGNAL
         vol_safe = vol if vol is not None else 0.0
-        prev_vol = float(two_rows[1]["volume_m5"]) if len(two_rows) >= 2 and two_rows[1]["volume_m5"] is not None else 0.0  # Fix 4: NULL-safe
+        prev_vol = float(two_rows[1]["volume_m5"]) if len(two_rows) >= 2 and two_rows[1]["volume_m5"] is not None else 0.0
         vol_min = max(prev_vol, 300.0)
         bounce_ok = last_price >= low_price * 1.01
         buys_gt_sells = buys > sells
@@ -839,10 +803,10 @@ class Database:
             )
             self._conn.commit()
 
-    def prune_dump_watchlist(self, ttl_hours: float = 3) -> int:
+    def prune_dump_watchlist(self, ttl_hours: float = config.DUMP_WATCHLIST_TTL_HOURS) -> int:
         """
         Remove expired entries (by updated_at_ms TTL) and orphaned entries (pair not in pairs).
-        Fix 2: TTL uses updated_at_ms, not added_at_ms.
+        Returns number of rows deleted.
         """
         now_ms = int(time.time() * 1000)
         cutoff_ms = now_ms - int(ttl_hours * 3600 * 1000)
@@ -892,6 +856,7 @@ class Database:
             yield dict(row)
 
     def close(self) -> None:
+        """Close DB connection."""
         if self._conn:
             self._conn.close()
             self._conn = None

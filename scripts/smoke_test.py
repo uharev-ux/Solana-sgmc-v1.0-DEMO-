@@ -13,8 +13,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dexscreener_screener.client import DexScreenerClient
-from dexscreener_screener.db import Database
 from dexscreener_screener.models import PairSnapshot, from_api_pair
+from dexscreener_screener.pipeline import Collector
+from dexscreener_screener.storage import Database
 
 # Real Solana pair address (from DexScreener tokens API)
 KNOWN_PAIR = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
@@ -51,7 +52,6 @@ def smoke_db_and_collect() -> bool:
     for f in [TEST_DB, TEST_JSON, TEST_CSV]:
         if Path(f).exists():
             Path(f).unlink()
-    from dexscreener_screener.collector import Collector
 
     db = Database(TEST_DB)
     client = DexScreenerClient(timeout_sec=15, max_retries=2, rate_limit_rps=2)

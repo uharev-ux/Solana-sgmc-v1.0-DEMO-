@@ -1,15 +1,17 @@
-"""Collector: fetch pairs by tokens or by pair addresses and persist to DB."""
+"""Collector: fetch pairs via client, normalize, persist via storage. Orchestrates client + storage."""
+
+from __future__ import annotations
 
 import csv
-import logging
 import time
 from pathlib import Path
 
 from dexscreener_screener.client import DexScreenerClient
-from dexscreener_screener.db import Database
+from dexscreener_screener.logging_setup import get_logger
 from dexscreener_screener.models import from_api_pair
+from dexscreener_screener.storage import Database
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def parse_addresses_input(value: str) -> list[str]:
@@ -41,7 +43,7 @@ def parse_addresses_input(value: str) -> list[str]:
 
 
 class Collector:
-    """Collects pair data from DexScreener API and writes to Database."""
+    """Orchestrates fetch (client) -> normalize (models) -> persist (storage)."""
 
     def __init__(self, client: DexScreenerClient, db: Database) -> None:
         self.client = client
@@ -49,7 +51,7 @@ class Collector:
 
     def collect_for_tokens(self, token_addresses: list[str]) -> tuple[int, int]:
         """
-        Mode A: fetch pairs by token addresses (token-pairs/tokens), normalize, persist.
+        Mode A: fetch pairs by token addresses, normalize, persist.
         Returns (pairs_processed, errors).
         """
         if not token_addresses:
@@ -61,7 +63,7 @@ class Collector:
 
     def collect_for_pairs(self, pair_addresses: list[str]) -> tuple[int, int]:
         """
-        Mode B: fetch pairs by pair addresses (/pairs), normalize, persist.
+        Mode B: fetch pairs by pair addresses, normalize, persist.
         Returns (pairs_processed, errors).
         """
         if not pair_addresses:
@@ -75,7 +77,8 @@ class Collector:
         self, raw_pairs: list[dict], known_pair_addresses: set[str]
     ) -> tuple[int, int, int]:
         """
-        Filter raw pairs to those not in known_pair_addresses, persist, return (processed, errors, skipped).
+        Filter raw pairs to those not in known_pair_addresses, persist.
+        Returns (processed, errors, skipped).
         """
         filtered = []
         for raw in raw_pairs:
@@ -89,6 +92,7 @@ class Collector:
         return processed, errors, skipped
 
     def _persist_pairs(self, raw_pairs: list[dict]) -> tuple[int, int]:
+        """Normalize raw API pairs to PairSnapshot and write to DB. Returns (processed, errors)."""
         snapshot_ts = int(time.time() * 1000)
         processed = 0
         errors = 0
