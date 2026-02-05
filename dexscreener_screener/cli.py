@@ -14,6 +14,7 @@ from dexscreener_screener.logging_setup import get_logger, setup_logging
 from dexscreener_screener.models import PairSnapshot, from_api_pair
 from dexscreener_screener.pipeline import Collector, parse_addresses_input
 from dexscreener_screener.storage import Database
+from dexscreener_screener.strategy import run_strategy_once
 
 setup_logging()
 logger = get_logger(__name__)
@@ -340,6 +341,79 @@ def cmd_collect_new(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_strategy(args: argparse.Namespace) -> int:
+    """
+    Run strategy screener (ATH-based drawdown). --once or --loop N.
+    Output: WATCHLIST (pair, drop_from_ath, liq, vol, txns); SIGNAL (pair, drop_from_ath, ath_price, current_price, DexScreener link).
+    """
+    db_path = args.db or config.DEFAULT_DB
+    if not Path(db_path).exists():
+        logger.error("Database not found: %s", db_path)
+        return 1
+    db = Database(db_path)
+    try:
+        loop_interval = getattr(args, "loop", None)
+        if loop_interval is not None:
+            interval = max(1, int(loop_interval))
+            shutdown = [False]
+
+            def _on_sigint(signum, frame):
+                if shutdown[0]:
+                    sys.exit(1)
+                shutdown[0] = True
+                logger.info("SIGINT received, finishing cycle then exiting")
+
+            signal.signal(signal.SIGINT, _on_sigint)
+            while not shutdown[0]:
+                watchlist, signals = run_strategy_once(db)
+                _print_strategy_output(watchlist, signals)
+                if shutdown[0]:
+                    break
+                time.sleep(interval)
+        else:
+            watchlist, signals = run_strategy_once(db)
+            _print_strategy_output(watchlist, signals)
+        return 0
+    finally:
+        db.close()
+
+
+def _print_strategy_output(
+    watchlist: list[dict],
+    signals: list[dict],
+) -> None:
+    """Print WATCHLIST and SIGNAL lines."""
+    print("--- WATCHLIST ---")
+    if not watchlist:
+        print("(none)")
+    else:
+        fmt = "%-44s %7s %12s %12s %6s"
+        print(fmt % ("pair", "drop%", "liq", "vol", "txns"))
+        for e in watchlist:
+            print(
+                fmt
+                % (
+                    (e.get("pair_address") or "")[:44],
+                    "%.1f" % (e.get("drop_from_ath") or 0),
+                    "%.0f" % (e.get("liquidity_usd") or 0),
+                    "%.0f" % (e.get("volume_h24") or 0),
+                    e.get("txns_h24") or 0,
+                )
+            )
+    print("--- SIGNAL ---")
+    if not signals:
+        print("(none)")
+    else:
+        for e in signals:
+            pair = (e.get("pair_address") or "")[:44]
+            drop = "%.1f" % (e.get("drop_from_ath") or 0)
+            ath = "%.6g" % (e.get("ath_price") or 0)
+            cur = "%.6g" % (e.get("current_price") or 0)
+            url = e.get("url") or ""
+            print("pair=%s drop_from_ath=%s%% ath_price=%s current_price=%s %s" % (pair, drop, ath, cur, url))
+    print("---")
+
+
 def cmd_dump_watchlist(args: argparse.Namespace) -> int:
     """List dump watchlist entries (pair_address, state, drop_pct, peak_price, low_price, last_price, updated_at_ms, signal_price)."""
     db_path = args.db or config.DEFAULT_DB
@@ -545,6 +619,15 @@ def main() -> int:
     check_parser.add_argument("--max-retries", type=int, default=config.CHECK_MAX_RETRIES, help="Max HTTP retries")
     check_parser.add_argument("--rate-limit-rps", type=float, default=config.CHECK_RATE_LIMIT_RPS, help="Max requests per second")
     check_parser.set_defaults(func=cmd_check)
+
+    strategy_parser = subparsers.add_parser(
+        "strategy",
+        help="Strategy screener (ATH-based drawdown): WATCHLIST / SIGNAL from price history",
+    )
+    strategy_parser.add_argument("--db", default=config.DEFAULT_DB, help="SQLite database path (default: %s)" % config.DEFAULT_DB)
+    strategy_parser.add_argument("--once", action="store_true", help="Run once and exit")
+    strategy_parser.add_argument("--loop", type=float, metavar="SEC", help="Run every N seconds until Ctrl+C")
+    strategy_parser.set_defaults(func=cmd_strategy)
 
     args = parser.parse_args()
     return args.func(args)

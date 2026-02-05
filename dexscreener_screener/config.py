@@ -52,3 +52,18 @@ PAIRS_QUOTE_CANDIDATES = [
     "quoteTokenAddress", "quoteTokenMint", "quoteToken",
 ]
 TOKENS_ADDR_CANDIDATES = ["address", "token_address", "mint", "token_mint"]
+
+# --- Strategy screener (second layer): ATH-based drawdown ---
+STRATEGY_MAX_AGE_HOURS = 24.0
+STRATEGY_MIN_LIQ = 10_000.0
+STRATEGY_MIN_VOL = 500.0
+STRATEGY_MIN_TXNS = 5
+
+WATCHLIST_MIN_DROP = 30.0
+SIGNAL_MIN_DROP = 50.0
+SIGNAL_MAX_DROP = 60.0
+
+TXNS_SIGNAL = 10
+BUYS_MIN = 5
+LIQ_SIGNAL = 5_000.0
+SIGNAL_COOLDOWN_SEC = 3600

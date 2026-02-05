@@ -115,3 +115,19 @@ python -m dexscreener_screener.cli self-check --db dexscreener.sqlite
 ```bash
 python -m dexscreener_screener.cli self-check --db dexscreener.sqlite --fix
 ```
+
+### Strategy (второй скринер: ATH и просадка)
+
+Стратегический слой на основе **реальных цен** из БД (без %change). ATH = max(price) за жизнь пары (age ≤ 24h), просадка: `drop_from_ath = (ath_price - current_price) / ath_price * 100`. Hard-фильтры: age ≤ 24h, liquidity ≥ MIN_LIQ, volume ≥ MIN_VOL, txns ≥ MIN_TXNS, ath ≠ current. WATCHLIST: просадка 30–50%; SIGNAL: просадка 50–60%, рынок жив (txns, buys, liq), cooldown.
+
+**Один запуск:**
+```bash
+python -m dexscreener_screener.cli strategy --once --db dexscreener.sqlite
+```
+
+**Цикл каждые 60 секунд (остановка: Ctrl+C):**
+```bash
+python -m dexscreener_screener.cli strategy --loop 60 --db dexscreener.sqlite
+```
+
+Вывод: WATCHLIST (pair, drop%, liq, vol, txns) и SIGNAL (pair, drop%, ath_price, current_price, ссылка DexScreener).

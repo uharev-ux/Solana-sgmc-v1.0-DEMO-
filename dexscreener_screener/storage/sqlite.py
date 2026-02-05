@@ -136,6 +136,28 @@ CREATE TABLE IF NOT EXISTS dump_watchlist (
 IDX_DUMP_WATCHLIST_STATE = "CREATE INDEX IF NOT EXISTS idx_dump_watchlist_state ON dump_watchlist(state);"
 IDX_DUMP_WATCHLIST_UPDATED = "CREATE INDEX IF NOT EXISTS idx_dump_watchlist_updated ON dump_watchlist(updated_at_ms);"
 
+# --- Strategy layer (second screener): ATH-based drawdown ---
+SCHEMA_STRATEGY_DECISIONS = """
+CREATE TABLE IF NOT EXISTS strategy_decisions (
+    pair_address TEXT NOT NULL,
+    decided_at INTEGER NOT NULL,
+    decision TEXT NOT NULL,
+    current_price REAL,
+    ath_price REAL,
+    drop_from_ath REAL,
+    reasons_json TEXT
+);
+"""
+IDX_STRATEGY_DECISIONS_PAIR = "CREATE INDEX IF NOT EXISTS idx_strategy_decisions_pair ON strategy_decisions(pair_address);"
+IDX_STRATEGY_DECISIONS_DECIDED = "CREATE INDEX IF NOT EXISTS idx_strategy_decisions_decided_at ON strategy_decisions(decided_at);"
+
+SCHEMA_SIGNAL_COOLDOWNS = """
+CREATE TABLE IF NOT EXISTS signal_cooldowns (
+    pair_address TEXT PRIMARY KEY,
+    last_signal_at INTEGER NOT NULL
+);
+"""
+
 PAIRS_COLUMNS = [
     "pair_address", "chain_id", "dex_id", "url",
     "base_address", "base_symbol", "base_name",
@@ -255,6 +277,7 @@ class Database:
             + IDX_SNAPSHOTS_PAIR_TS + IDX_SNAPSHOTS_PAIR + IDX_PAIRS_CREATED
         )
         self.ensure_dump_watchlist_schema()
+        self.ensure_strategy_schema()
         self._conn.commit()
 
     def upsert_token(self, token: TokenInfo) -> None:
@@ -854,6 +877,127 @@ class Database:
         cur.execute(sql, params)
         for row in cur:
             yield dict(row)
+
+    # --- Price history (from snapshots; no %change) ---
+
+    def fetch_price_history(
+        self,
+        pair_address: str,
+        since_ts: int | None = None,
+    ) -> list[tuple[int, float]]:
+        """Return list of (ts, price) from snapshots for pair_address. ts = snapshot_ts (unix ms)."""
+        cur = self._conn.cursor()
+        sql = """
+            SELECT snapshot_ts, price_usd
+            FROM snapshots
+            WHERE pair_address = ? AND price_usd IS NOT NULL AND price_usd > 0
+        """
+        params: list[Any] = [pair_address]
+        if since_ts is not None:
+            sql += " AND snapshot_ts >= ?"
+            params.append(since_ts)
+        sql += " ORDER BY snapshot_ts ASC"
+        cur.execute(sql, params)
+        return [(int(r["snapshot_ts"]), float(r["price_usd"])) for r in cur]
+
+    def fetch_latest_price(self, pair_address: str) -> float | None:
+        """Return latest price_usd for pair (from pairs table or last snapshot)."""
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT price_usd FROM pairs WHERE pair_address = ?",
+            (pair_address,),
+        ).fetchone()
+        if row and row["price_usd"] is not None:
+            return float(row["price_usd"])
+        row = cur.execute(
+            """
+            SELECT price_usd FROM snapshots
+            WHERE pair_address = ? AND price_usd IS NOT NULL AND price_usd > 0
+            ORDER BY snapshot_ts DESC LIMIT 1
+            """,
+            (pair_address,),
+        ).fetchone()
+        if row:
+            return float(row["price_usd"])
+        return None
+
+    def fetch_ath_price(
+        self,
+        pair_address: str,
+        since_ts: int | None = None,
+    ) -> float | None:
+        """Return max(price_usd) from snapshots for pair_address (life of pair if since_ts given)."""
+        cur = self._conn.cursor()
+        sql = """
+            SELECT MAX(price_usd) AS ath
+            FROM snapshots
+            WHERE pair_address = ? AND price_usd IS NOT NULL AND price_usd > 0
+        """
+        params: list[Any] = [pair_address]
+        if since_ts is not None:
+            sql += " AND snapshot_ts >= ?"
+            params.append(since_ts)
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        if row and row["ath"] is not None:
+            return float(row["ath"])
+        return None
+
+    # --- Strategy layer tables ---
+
+    def ensure_strategy_schema(self) -> None:
+        """Create strategy_decisions and signal_cooldowns tables and indexes if missing."""
+        cur = self._conn.cursor()
+        cur.executescript(
+            SCHEMA_STRATEGY_DECISIONS
+            + IDX_STRATEGY_DECISIONS_PAIR
+            + IDX_STRATEGY_DECISIONS_DECIDED
+            + SCHEMA_SIGNAL_COOLDOWNS
+        )
+        self._conn.commit()
+
+    def insert_strategy_decision(
+        self,
+        pair_address: str,
+        decision: str,
+        current_price: float | None,
+        ath_price: float | None,
+        drop_from_ath: float | None,
+        reasons_json: str | None = None,
+    ) -> None:
+        """Append one strategy decision row."""
+        cur = self._conn.cursor()
+        decided_at = int(time.time() * 1000)
+        cur.execute(
+            """
+            INSERT INTO strategy_decisions
+            (pair_address, decided_at, decision, current_price, ath_price, drop_from_ath, reasons_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (pair_address, decided_at, decision, current_price, ath_price, drop_from_ath, reasons_json),
+        )
+        self._conn.commit()
+
+    def get_last_signal_at(self, pair_address: str) -> int | None:
+        """Return last_signal_at (unix ms) for pair from signal_cooldowns, or None."""
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT last_signal_at FROM signal_cooldowns WHERE pair_address = ?",
+            (pair_address,),
+        ).fetchone()
+        if row:
+            return int(row["last_signal_at"])
+        return None
+
+    def set_signal_cooldown(self, pair_address: str) -> None:
+        """Set or update last_signal_at for pair (now, unix ms)."""
+        cur = self._conn.cursor()
+        now_ms = int(time.time() * 1000)
+        cur.execute(
+            "INSERT OR REPLACE INTO signal_cooldowns (pair_address, last_signal_at) VALUES (?, ?)",
+            (pair_address, now_ms),
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         """Close DB connection."""
