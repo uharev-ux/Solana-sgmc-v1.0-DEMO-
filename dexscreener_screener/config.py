@@ -59,6 +59,13 @@ STRATEGY_MIN_LIQ = 10_000.0
 STRATEGY_MIN_VOL = 500.0
 STRATEGY_MIN_TXNS = 5
 
+# --- ATH validation (avoid single-trade spikes) ---
+ATH_VALIDATE_WINDOW_SEC = 300.0  # window around ATH timestamp (half before, half after)
+ATH_MIN_SNAPSHOTS_IN_WINDOW = 2  # min snapshots in window to accept ATH
+ATH_MIN_TXNS_IN_WINDOW = 1       # min txns in window if txns available
+ATH_MIN_VOLUME_IN_WINDOW = 0.0   # min volume in window if volume available (0 = no floor)
+ATH_FALLBACK_MAX_ATTEMPTS = 10   # max candidate peaks to try when raw ATH is invalid
+
 WATCHLIST_MIN_DROP = 30.0
 SIGNAL_MIN_DROP = 50.0
 SIGNAL_MAX_DROP = 60.0

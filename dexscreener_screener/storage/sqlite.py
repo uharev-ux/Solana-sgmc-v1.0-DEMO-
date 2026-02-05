@@ -174,6 +174,13 @@ PAIRS_COLUMNS = [
 SNAPSHOTS_COLUMNS = ["pair_address"] + PAIRS_COLUMNS[1:]
 
 
+def normalize_since_ts(created_at_ms: int, snapshot_ts_is_ms: bool) -> int:
+    """Convert created_at_ms to same unit as snapshot_ts for comparison. created_at_ms is always ms."""
+    if snapshot_ts_is_ms:
+        return created_at_ms
+    return created_at_ms // 1000
+
+
 def _pragma_table_info(conn: sqlite3.Connection, table: str) -> list[tuple[str, str]]:
     """Return (name, type) for each column in table."""
     cur = conn.execute(f"PRAGMA table_info({table})")
@@ -880,13 +887,24 @@ class Database:
 
     # --- Price history (from snapshots; no %change) ---
 
+    def _detect_snapshot_ts_unit(self) -> bool:
+        """True if snapshot_ts is in milliseconds (MAX > 10**12), else False. If no snapshots, return True (assume ms)."""
+        cur = self._conn.cursor()
+        row = cur.execute("SELECT MAX(snapshot_ts) FROM snapshots").fetchone()
+        if not row or row[0] is None:
+            return True
+        return int(row[0]) > 10**12
+
     def fetch_price_history(
         self,
         pair_address: str,
         since_ts: int | None = None,
     ) -> list[tuple[int, float]]:
-        """Return list of (ts, price) from snapshots for pair_address. ts = snapshot_ts (unix ms)."""
+        """Return list of (ts, price) from snapshots for pair_address. since_ts normalized to snapshot_ts unit (ms or sec)."""
         cur = self._conn.cursor()
+        if since_ts is not None:
+            snapshot_ts_is_ms = self._detect_snapshot_ts_unit()
+            since_ts = normalize_since_ts(since_ts, snapshot_ts_is_ms)
         sql = """
             SELECT snapshot_ts, price_usd
             FROM snapshots
@@ -901,14 +919,8 @@ class Database:
         return [(int(r["snapshot_ts"]), float(r["price_usd"])) for r in cur]
 
     def fetch_latest_price(self, pair_address: str) -> float | None:
-        """Return latest price_usd for pair (from pairs table or last snapshot)."""
+        """Latest price: from last snapshot if pair has snapshots; else from pairs table."""
         cur = self._conn.cursor()
-        row = cur.execute(
-            "SELECT price_usd FROM pairs WHERE pair_address = ?",
-            (pair_address,),
-        ).fetchone()
-        if row and row["price_usd"] is not None:
-            return float(row["price_usd"])
         row = cur.execute(
             """
             SELECT price_usd FROM snapshots
@@ -919,6 +931,12 @@ class Database:
         ).fetchone()
         if row:
             return float(row["price_usd"])
+        row = cur.execute(
+            "SELECT price_usd FROM pairs WHERE pair_address = ?",
+            (pair_address,),
+        ).fetchone()
+        if row and row["price_usd"] is not None:
+            return float(row["price_usd"])
         return None
 
     def fetch_ath_price(
@@ -926,8 +944,11 @@ class Database:
         pair_address: str,
         since_ts: int | None = None,
     ) -> float | None:
-        """Return max(price_usd) from snapshots for pair_address (life of pair if since_ts given)."""
+        """Return max(price_usd) from snapshots. since_ts (pair_created_at_ms) normalized to snapshot_ts unit."""
         cur = self._conn.cursor()
+        if since_ts is not None:
+            snapshot_ts_is_ms = self._detect_snapshot_ts_unit()
+            since_ts = normalize_since_ts(since_ts, snapshot_ts_is_ms)
         sql = """
             SELECT MAX(price_usd) AS ath
             FROM snapshots
@@ -942,6 +963,159 @@ class Database:
         if row and row["ath"] is not None:
             return float(row["ath"])
         return None
+
+    def fetch_ath_point(
+        self,
+        pair_address: str,
+        since_ts: int | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Return ATH point and current (latest) point for the pair.
+        Keys: ath_price, ath_ts, current_price, current_ts.
+        since_ts normalized to snapshot_ts unit. Returns None if no valid data.
+        """
+        cur = self._conn.cursor()
+        if since_ts is not None:
+            snapshot_ts_is_ms = self._detect_snapshot_ts_unit()
+            since_ts = normalize_since_ts(since_ts, snapshot_ts_is_ms)
+        base_sql = """
+            FROM snapshots
+            WHERE pair_address = ? AND price_usd IS NOT NULL AND price_usd > 0
+        """
+        base_params: list[Any] = [pair_address]
+        if since_ts is not None:
+            base_sql += " AND snapshot_ts >= ?"
+            base_params.append(since_ts)
+
+        ath_row = cur.execute(
+            "SELECT price_usd AS ath_price, snapshot_ts AS ath_ts " + base_sql + " ORDER BY price_usd DESC, snapshot_ts DESC LIMIT 1",
+            base_params,
+        ).fetchone()
+        current_row = cur.execute(
+            "SELECT price_usd AS current_price, snapshot_ts AS current_ts " + base_sql + " ORDER BY snapshot_ts DESC LIMIT 1",
+            base_params,
+        ).fetchone()
+        if not ath_row or not current_row or ath_row["ath_price"] is None or current_row["current_price"] is None:
+            return None
+        return {
+            "ath_price": float(ath_row["ath_price"]),
+            "ath_ts": int(ath_row["ath_ts"]),
+            "current_price": float(current_row["current_price"]),
+            "current_ts": int(current_row["current_ts"]),
+        }
+
+    def fetch_activity_window(
+        self,
+        pair_address: str,
+        center_ts: int,
+        window_sec: float,
+    ) -> dict[str, Any]:
+        """
+        Activity around center_ts: [center_ts - window_sec/2, center_ts + window_sec/2].
+        center_ts and snapshot_ts must be in the same unit (ms or sec).
+        Returns: snapshots_count; txns_sum, buys_sum, sells_sum, volume_sum if columns exist.
+        Uses snapshots_count as activity proxy when txns/volume are missing.
+        """
+        cur = self._conn.cursor()
+        snapshot_ts_is_ms = self._detect_snapshot_ts_unit()
+        half = int((window_sec * (1000 if snapshot_ts_is_ms else 1)) / 2)
+        ts_lo = center_ts - half
+        ts_hi = center_ts + half
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS snapshots_count
+            FROM snapshots
+            WHERE pair_address = ? AND snapshot_ts >= ? AND snapshot_ts <= ?
+            """,
+            (pair_address, ts_lo, ts_hi),
+        )
+        row = cur.fetchone()
+        snapshots_count = int(row["snapshots_count"]) if row else 0
+
+        cols = _pragma_table_info(self._conn, "snapshots")
+        has_txns = _pick(cols, ["txns_m5_buys", "txns_m5_sells", "txns_h1_buys", "txns_h1_sells"]) is not None
+        has_volume = _pick(cols, ["volume_m5", "volume_h1", "volume_h24"]) is not None
+
+        txns_sum: int | None = None
+        buys_sum: int | None = None
+        sells_sum: int | None = None
+        volume_sum: float | None = None
+
+        if has_txns:
+            buys_col = _pick(cols, ["txns_m5_buys", "txns_h1_buys"])
+            sells_col = _pick(cols, ["txns_m5_sells", "txns_h1_sells"])
+            if buys_col and sells_col:
+                cur.execute(
+                    f"""
+                    SELECT
+                        COALESCE(SUM(COALESCE({buys_col}, 0) + COALESCE({sells_col}, 0)), 0) AS txns_sum,
+                        COALESCE(SUM(COALESCE({buys_col}, 0)), 0) AS buys_sum,
+                        COALESCE(SUM(COALESCE({sells_col}, 0)), 0) AS sells_sum
+                    FROM snapshots
+                    WHERE pair_address = ? AND snapshot_ts >= ? AND snapshot_ts <= ?
+                    """,
+                    (pair_address, ts_lo, ts_hi),
+                )
+                r = cur.fetchone()
+                if r:
+                    txns_sum = int(r["txns_sum"])
+                    buys_sum = int(r["buys_sum"])
+                    sells_sum = int(r["sells_sum"])
+
+        if has_volume:
+            vol_col = _pick(cols, ["volume_m5", "volume_h1", "volume_h24"])
+            if vol_col:
+                cur.execute(
+                    f"""
+                    SELECT COALESCE(SUM(COALESCE({vol_col}, 0)), 0) AS volume_sum
+                    FROM snapshots
+                    WHERE pair_address = ? AND snapshot_ts >= ? AND snapshot_ts <= ?
+                    """,
+                    (pair_address, ts_lo, ts_hi),
+                )
+                r = cur.fetchone()
+                if r and r["volume_sum"] is not None:
+                    volume_sum = float(r["volume_sum"])
+
+        out: dict[str, Any] = {"snapshots_count": snapshots_count}
+        if txns_sum is not None:
+            out["txns_sum"] = txns_sum
+        if buys_sum is not None:
+            out["buys_sum"] = buys_sum
+        if sells_sum is not None:
+            out["sells_sum"] = sells_sum
+        if volume_sum is not None:
+            out["volume_sum"] = volume_sum
+        return out
+
+    def fetch_ath_candidates(
+        self,
+        pair_address: str,
+        since_ts: int | None = None,
+        limit: int = 1,
+    ) -> list[tuple[float, int]]:
+        """
+        Return up to `limit` (price_usd, snapshot_ts) rows ordered by price_usd DESC, snapshot_ts DESC.
+        Used for raw ATH (limit=1) and fallback search (limit=N).
+        """
+        cur = self._conn.cursor()
+        if since_ts is not None:
+            snapshot_ts_is_ms = self._detect_snapshot_ts_unit()
+            since_ts = normalize_since_ts(since_ts, snapshot_ts_is_ms)
+        sql = """
+            SELECT price_usd, snapshot_ts
+            FROM snapshots
+            WHERE pair_address = ? AND price_usd IS NOT NULL AND price_usd > 0
+        """
+        params: list[Any] = [pair_address]
+        if since_ts is not None:
+            sql += " AND snapshot_ts >= ?"
+            params.append(since_ts)
+        sql += " ORDER BY price_usd DESC, snapshot_ts DESC LIMIT ?"
+        params.append(max(1, limit))
+        cur.execute(sql, params)
+        return [(float(r["price_usd"]), int(r["snapshot_ts"])) for r in cur]
 
     # --- Strategy layer tables ---
 
