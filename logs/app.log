@@ -1,0 +1,19 @@
+2026-02-05 10:54:18,961 INFO dexscreener_screener.cli: Exported 1 row(s) to test_smoke_out.json (json)
+2026-02-05 10:54:18,975 INFO dexscreener_screener.cli: Exported 1 row(s) to test_smoke_out.csv (csv)
+2026-02-05 10:54:19,587 INFO dexscreener_screener.cli: prune (dry-run): would delete snapshots=0 pairs=0 tokens=0
+2026-02-05 10:54:19,588 INFO dexscreener_screener.cli: prune (dry-run): would delete snapshots=1 pairs=1 tokens=0
+2026-02-05 10:54:28,743 ERROR __main__: Database not found: C:\Users\tytst\Desktop\Solana-sgmc-v1.0-DEMO-\nonexistent.sqlite
+2026-02-05 10:54:31,129 INFO dexscreener_screener.cli: Exported 1 row(s) to test_smoke_out.json (json)
+2026-02-05 10:54:31,140 INFO dexscreener_screener.cli: Exported 1 row(s) to test_smoke_out.csv (csv)
+2026-02-05 10:54:31,734 INFO dexscreener_screener.cli: prune (dry-run): would delete snapshots=0 pairs=0 tokens=0
+2026-02-05 10:54:31,735 INFO dexscreener_screener.cli: prune (dry-run): would delete snapshots=1 pairs=1 tokens=0
+2026-02-05 10:54:32,763 INFO dexscreener_screener.pipeline.collector: collect_for_pairs: starting for 1 pair address(es)
+2026-02-05 10:54:33,774 INFO dexscreener_screener.pipeline.collector: Persisted 1 pair(s), 0 error(s)
+2026-02-05 10:54:33,778 INFO __main__: auto-prune: snapshots=1 pairs=1 tokens=2
+2026-02-05 10:54:33,781 INFO __main__: Done: 1 pair(s) written, 0 error(s)
+2026-02-05 10:54:35,290 INFO __main__: prune (dry-run): would delete snapshots=0 pairs=0 tokens=0
+2026-02-05 10:54:35,494 INFO __main__: prune: deleted snapshots=0 pairs=0 tokens=0
+2026-02-05 10:57:09,175 INFO dexscreener_screener.cli: Exported 1 row(s) to test_smoke_out.json (json)
+2026-02-05 10:57:09,186 INFO dexscreener_screener.cli: Exported 1 row(s) to test_smoke_out.csv (csv)
+2026-02-05 10:57:09,785 INFO dexscreener_screener.cli: prune (dry-run): would delete snapshots=0 pairs=0 tokens=0
+2026-02-05 10:57:09,786 INFO dexscreener_screener.cli: prune (dry-run): would delete snapshots=1 pairs=1 tokens=0

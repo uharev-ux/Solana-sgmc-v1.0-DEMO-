@@ -152,10 +152,95 @@ CREATE TABLE IF NOT EXISTS strategy_decisions (
 IDX_STRATEGY_DECISIONS_PAIR = "CREATE INDEX IF NOT EXISTS idx_strategy_decisions_pair ON strategy_decisions(pair_address);"
 IDX_STRATEGY_DECISIONS_DECIDED = "CREATE INDEX IF NOT EXISTS idx_strategy_decisions_decided_at ON strategy_decisions(decided_at);"
 
+# --- Strategy latest: one row per pair for fast last-status queries ---
+SCHEMA_STRATEGY_LATEST = """
+CREATE TABLE IF NOT EXISTS strategy_latest (
+    pair_address TEXT PRIMARY KEY,
+    last_decision TEXT NOT NULL,
+    last_score REAL,
+    last_drop_from_ath REAL,
+    last_current_price REAL,
+    last_ath_price REAL,
+    last_decided_at INTEGER NOT NULL,
+    last_reasons_json TEXT
+);
+"""
+
 SCHEMA_SIGNAL_COOLDOWNS = """
 CREATE TABLE IF NOT EXISTS signal_cooldowns (
     pair_address TEXT PRIMARY KEY,
     last_signal_at INTEGER NOT NULL
+);
+"""
+
+# --- Signal events and evaluations for post-analysis ---
+SCHEMA_SIGNAL_EVENTS = """
+CREATE TABLE IF NOT EXISTS signal_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_address TEXT NOT NULL,
+    signal_ts INTEGER NOT NULL,
+    entry_price REAL NOT NULL,
+    ath_price REAL NOT NULL,
+    drop_from_ath REAL NOT NULL,
+    score REAL NOT NULL,
+    features_json TEXT
+);
+"""
+IDX_SIGNAL_EVENTS_PAIR = "CREATE INDEX IF NOT EXISTS idx_signal_events_pair ON signal_events(pair_address);"
+IDX_SIGNAL_EVENTS_TS = "CREATE INDEX IF NOT EXISTS idx_signal_events_signal_ts ON signal_events(signal_ts);"
+
+SCHEMA_SIGNAL_EVALUATIONS = """
+CREATE TABLE IF NOT EXISTS signal_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id INTEGER NOT NULL REFERENCES signal_events(id),
+    horizon_sec INTEGER NOT NULL,
+    evaluated_at INTEGER,
+    price_end REAL,
+    max_price REAL,
+    min_price REAL,
+    return_end_pct REAL,
+    max_return_pct REAL,
+    min_return_pct REAL,
+    status TEXT NOT NULL DEFAULT 'PENDING'
+);
+"""
+IDX_SIGNAL_EVALUATIONS_SIGNAL = "CREATE INDEX IF NOT EXISTS idx_signal_evaluations_signal ON signal_evaluations(signal_id);"
+IDX_SIGNAL_EVALUATIONS_STATUS = "CREATE INDEX IF NOT EXISTS idx_signal_evaluations_status ON signal_evaluations(status);"
+
+# --- Trigger-based signal evaluations (TP1/SL/BU) ---
+SCHEMA_SIGNAL_TRIGGER_EVALUATIONS = """
+CREATE TABLE IF NOT EXISTS signal_trigger_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id INTEGER NOT NULL REFERENCES signal_events(id),
+    evaluated_at INTEGER,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    outcome TEXT,
+    tp1_hit_ts INTEGER,
+    sl_hit_ts INTEGER,
+    tp1_price REAL,
+    sl_price REAL,
+    mfe_pct REAL,
+    mae_pct REAL,
+    max_price REAL,
+    min_price REAL,
+    bu_hit_after_tp1 INTEGER,
+    post_tp1_max_pct REAL,
+    post_tp1_max_price REAL,
+    UNIQUE(signal_id)
+);
+"""
+IDX_SIGNAL_TRIGGER_EVALS_STATUS = "CREATE INDEX IF NOT EXISTS idx_signal_trigger_evals_status ON signal_trigger_evaluations(status);"
+
+# --- App status (singleton row id=1): heartbeat for UI/diagnostics ---
+SCHEMA_APP_STATUS = """
+CREATE TABLE IF NOT EXISTS app_status (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    updated_at_ms INTEGER NOT NULL,
+    last_cycle_started_at_ms INTEGER,
+    last_cycle_finished_at_ms INTEGER,
+    last_error TEXT,
+    last_error_at_ms INTEGER,
+    counters_json TEXT
 );
 """
 
@@ -286,6 +371,7 @@ class Database:
         )
         self.ensure_dump_watchlist_schema()
         self.ensure_strategy_schema()
+        self.ensure_app_status_schema()
         self._conn.commit()
 
     def upsert_token(self, token: TokenInfo) -> None:
@@ -919,6 +1005,15 @@ class Database:
         cur.execute(sql, params)
         return [(int(r["snapshot_ts"]), float(r["price_usd"])) for r in cur]
 
+    def get_snapshot_count(self, pair_address: str) -> int:
+        """Return number of snapshots for the pair (for bootstrap: insufficient price history)."""
+        cur = self._conn.cursor()
+        row = cur.execute(
+            "SELECT COUNT(*) FROM snapshots WHERE pair_address = ?",
+            (pair_address,),
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
     def fetch_latest_price(self, pair_address: str) -> float | None:
         """Latest price: from last snapshot if pair has snapshots; else from pairs table."""
         cur = self._conn.cursor()
@@ -1121,14 +1216,28 @@ class Database:
     # --- Strategy layer tables ---
 
     def ensure_strategy_schema(self) -> None:
-        """Create strategy_decisions and signal_cooldowns tables and indexes if missing."""
+        """Create strategy_decisions, strategy_latest, signal_cooldowns, signal_events, signal_evaluations tables and indexes if missing."""
         cur = self._conn.cursor()
         cur.executescript(
             SCHEMA_STRATEGY_DECISIONS
             + IDX_STRATEGY_DECISIONS_PAIR
             + IDX_STRATEGY_DECISIONS_DECIDED
+            + SCHEMA_STRATEGY_LATEST
             + SCHEMA_SIGNAL_COOLDOWNS
+            + SCHEMA_SIGNAL_EVENTS
+            + IDX_SIGNAL_EVENTS_PAIR
+            + IDX_SIGNAL_EVENTS_TS
+            + SCHEMA_SIGNAL_EVALUATIONS
+            + IDX_SIGNAL_EVALUATIONS_SIGNAL
+            + IDX_SIGNAL_EVALUATIONS_STATUS
         )
+        self.ensure_trigger_eval_schema()
+        self._conn.commit()
+
+    def ensure_trigger_eval_schema(self) -> None:
+        """Create signal_trigger_evaluations table and index if missing."""
+        cur = self._conn.cursor()
+        cur.executescript(SCHEMA_SIGNAL_TRIGGER_EVALUATIONS + IDX_SIGNAL_TRIGGER_EVALS_STATUS)
         self._conn.commit()
 
     def insert_strategy_decision(
@@ -1140,7 +1249,7 @@ class Database:
         drop_from_ath: float | None,
         reasons_json: str | None = None,
     ) -> None:
-        """Append one strategy decision row."""
+        """Append one strategy decision row and UPSERT strategy_latest for fast last-status queries."""
         cur = self._conn.cursor()
         decided_at = int(time.time() * 1000)
         cur.execute(
@@ -1150,6 +1259,23 @@ class Database:
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (pair_address, decided_at, decision, current_price, ath_price, drop_from_ath, reasons_json),
+        )
+        # UPSERT strategy_latest (last_score = drop_from_ath for sorting)
+        cur.execute(
+            """
+            INSERT INTO strategy_latest
+            (pair_address, last_decision, last_score, last_drop_from_ath, last_current_price, last_ath_price, last_decided_at, last_reasons_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pair_address) DO UPDATE SET
+                last_decision = excluded.last_decision,
+                last_score = excluded.last_score,
+                last_drop_from_ath = excluded.last_drop_from_ath,
+                last_current_price = excluded.last_current_price,
+                last_ath_price = excluded.last_ath_price,
+                last_decided_at = excluded.last_decided_at,
+                last_reasons_json = excluded.last_reasons_json
+            """,
+            (pair_address, decision, drop_from_ath, drop_from_ath, current_price, ath_price, decided_at, reasons_json),
         )
         self._conn.commit()
 
@@ -1173,6 +1299,294 @@ class Database:
             (pair_address, now_ms),
         )
         self._conn.commit()
+
+    def insert_signal_event(
+        self,
+        pair_address: str,
+        signal_ts: int,
+        entry_price: float,
+        ath_price: float,
+        drop_from_ath: float,
+        score: float,
+        features_json: str | None = None,
+    ) -> int:
+        """Insert signal_event row and return its id."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO signal_events (pair_address, signal_ts, entry_price, ath_price, drop_from_ath, score, features_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (pair_address, signal_ts, entry_price, ath_price, drop_from_ath, score, features_json),
+        )
+        signal_id = cur.lastrowid
+        self._conn.commit()
+        return signal_id or 0
+
+    def insert_signal_evaluation(
+        self,
+        signal_id: int,
+        horizon_sec: int,
+        status: str = "PENDING",
+    ) -> None:
+        """Insert signal_evaluation row with PENDING status."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO signal_evaluations (signal_id, horizon_sec, status)
+            VALUES (?, ?, ?)
+            """,
+            (signal_id, horizon_sec, status),
+        )
+        self._conn.commit()
+
+    def iter_pending_evaluations(
+        self,
+        now_ts: int,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Yield PENDING evaluations where now_ts >= signal_ts + horizon_sec. Each row has eval_id, signal_id, horizon_sec, pair_address, signal_ts, entry_price."""
+        cur = self._conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signal_events'")
+        if not cur.fetchone():
+            return
+        cur.execute(
+            """
+            SELECT e.id AS eval_id, e.signal_id, e.horizon_sec, s.pair_address, s.signal_ts, s.entry_price
+            FROM signal_evaluations e
+            JOIN signal_events s ON s.id = e.signal_id
+            WHERE e.status = 'PENDING'
+            """
+        )
+        for row in cur:
+            d = dict(row)
+            signal_ts = int(d["signal_ts"])
+            horizon_sec = int(d["horizon_sec"])
+            ts_is_ms = signal_ts > 10**12
+            horizon_unit = horizon_sec * 1000 if ts_is_ms else horizon_sec
+            if now_ts < signal_ts + horizon_unit:
+                continue
+            yield d
+
+    def update_evaluation_done(
+        self,
+        eval_id: int,
+        evaluated_at: int,
+        price_end: float,
+        max_price: float,
+        min_price: float,
+        return_end_pct: float,
+        max_return_pct: float,
+        min_return_pct: float,
+    ) -> None:
+        """Update signal_evaluation to DONE with price and return metrics."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            UPDATE signal_evaluations SET
+                evaluated_at = ?, price_end = ?, max_price = ?, min_price = ?,
+                return_end_pct = ?, max_return_pct = ?, min_return_pct = ?,
+                status = 'DONE'
+            WHERE id = ?
+            """,
+            (evaluated_at, price_end, max_price, min_price, return_end_pct, max_return_pct, min_return_pct, eval_id),
+        )
+        self._conn.commit()
+
+    def update_evaluation_no_data(self, eval_id: int) -> None:
+        """Update signal_evaluation to NO_DATA."""
+        cur = self._conn.cursor()
+        cur.execute(
+            "UPDATE signal_evaluations SET status = 'NO_DATA' WHERE id = ?",
+            (eval_id,),
+        )
+        self._conn.commit()
+
+    # --- Trigger-based evaluations ---
+
+    def insert_trigger_eval_pending(self, signal_id: int) -> None:
+        """Create PENDING trigger eval row if none exists (UPSERT by signal_id)."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO signal_trigger_evaluations (signal_id, status)
+            VALUES (?, 'PENDING')
+            ON CONFLICT(signal_id) DO NOTHING
+            """,
+            (signal_id,),
+        )
+        self._conn.commit()
+
+    def iter_pending_trigger_evals(self, limit: int = 100) -> Generator[dict[str, Any], None, None]:
+        """Yield PENDING trigger evals: signal_id and signal_event fields (pair_address, signal_ts, entry_price)."""
+        cur = self._conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signal_trigger_evaluations'")
+        if not cur.fetchone():
+            return
+        cur.execute(
+            """
+            SELECT t.signal_id, s.pair_address, s.signal_ts, s.entry_price
+            FROM signal_trigger_evaluations t
+            JOIN signal_events s ON s.id = t.signal_id
+            WHERE t.status = 'PENDING'
+            ORDER BY t.signal_id ASC
+            LIMIT ?
+            """,
+            (max(1, limit),),
+        )
+        for row in cur:
+            yield {
+                "signal_id": int(row["signal_id"]),
+                "pair_address": str(row["pair_address"]),
+                "signal_ts": int(row["signal_ts"]),
+                "entry_price": float(row["entry_price"]),
+            }
+
+    def update_trigger_eval_done(
+        self,
+        signal_id: int,
+        evaluated_at: int,
+        outcome: str,
+        tp1_hit_ts: int | None = None,
+        sl_hit_ts: int | None = None,
+        tp1_price: float | None = None,
+        sl_price: float | None = None,
+        mfe_pct: float | None = None,
+        mae_pct: float | None = None,
+        max_price: float | None = None,
+        min_price: float | None = None,
+        bu_hit_after_tp1: int | None = None,
+        post_tp1_max_pct: float | None = None,
+        post_tp1_max_price: float | None = None,
+    ) -> None:
+        """Update signal_trigger_evaluation to DONE with payload."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            UPDATE signal_trigger_evaluations SET
+                evaluated_at = ?, status = 'DONE', outcome = ?,
+                tp1_hit_ts = ?, sl_hit_ts = ?, tp1_price = ?, sl_price = ?,
+                mfe_pct = ?, mae_pct = ?, max_price = ?, min_price = ?,
+                bu_hit_after_tp1 = ?, post_tp1_max_pct = ?, post_tp1_max_price = ?
+            WHERE signal_id = ?
+            """,
+            (
+                evaluated_at,
+                outcome,
+                tp1_hit_ts,
+                sl_hit_ts,
+                tp1_price,
+                sl_price,
+                mfe_pct,
+                mae_pct,
+                max_price,
+                min_price,
+                bu_hit_after_tp1,
+                post_tp1_max_pct,
+                post_tp1_max_price,
+                signal_id,
+            ),
+        )
+        self._conn.commit()
+
+    def update_trigger_eval_no_data(self, signal_id: int, reason: str | None = None) -> None:
+        """Update signal_trigger_evaluation to NO_DATA."""
+        cur = self._conn.cursor()
+        cur.execute(
+            "UPDATE signal_trigger_evaluations SET status = 'NO_DATA', evaluated_at = ? WHERE signal_id = ?",
+            (int(time.time() * 1000), signal_id),
+        )
+        self._conn.commit()
+
+    def get_signal_event_counts(self) -> tuple[int, int, int, int]:
+        """Return (signal_events_count, pending_count, done_count, no_data_count)."""
+        cur = self._conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signal_events'")
+        if not cur.fetchone():
+            return 0, 0, 0, 0
+        ev_cnt = cur.execute("SELECT COUNT(*) FROM signal_events").fetchone()[0]
+        cur.execute("SELECT status, COUNT(*) FROM signal_evaluations GROUP BY status")
+        by_status = dict(cur.fetchall())
+        pend = by_status.get("PENDING", 0)
+        done = by_status.get("DONE", 0)
+        nodata = by_status.get("NO_DATA", 0)
+        return int(ev_cnt), int(pend), int(done), int(nodata)
+
+    # --- App status (singleton heartbeat) ---
+
+    def ensure_app_status_schema(self) -> None:
+        """Create app_status table if missing."""
+        cur = self._conn.cursor()
+        cur.executescript(SCHEMA_APP_STATUS)
+        self._conn.commit()
+
+    def update_app_status(
+        self,
+        *,
+        last_cycle_started_at_ms: int | None = None,
+        last_cycle_finished_at_ms: int | None = None,
+        last_error: str | None = None,
+        last_error_at_ms: int | None = None,
+        counters_json: str | None = None,
+    ) -> None:
+        """
+        Upsert singleton row (id=1). Pass only fields to update.
+        On success: set last_cycle_finished_at_ms, clear last_error.
+        On exception: set last_error, last_error_at_ms.
+        """
+        now_ms = int(time.time() * 1000)
+        cur = self._conn.cursor()
+        cur.execute("SELECT id FROM app_status WHERE id = 1")
+        row = cur.fetchone()
+        if not row:
+            cur.execute(
+                """
+                INSERT INTO app_status (id, updated_at_ms, last_cycle_started_at_ms, last_cycle_finished_at_ms, last_error, last_error_at_ms, counters_json)
+                VALUES (1, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now_ms,
+                    last_cycle_started_at_ms if last_cycle_started_at_ms is not None else now_ms,
+                    last_cycle_finished_at_ms,
+                    last_error,
+                    last_error_at_ms,
+                    counters_json,
+                ),
+            )
+        else:
+            updates = ["updated_at_ms = ?"]
+            params: list[Any] = [now_ms]
+            if last_cycle_started_at_ms is not None:
+                updates.append("last_cycle_started_at_ms = ?")
+                params.append(last_cycle_started_at_ms)
+            if last_cycle_finished_at_ms is not None:
+                updates.append("last_cycle_finished_at_ms = ?")
+                params.append(last_cycle_finished_at_ms)
+            if last_error is not None:
+                updates.append("last_error = ?")
+                params.append(last_error)
+                if last_error == "":
+                    updates.append("last_error_at_ms = NULL")
+            if last_error_at_ms is not None:
+                updates.append("last_error_at_ms = ?")
+                params.append(last_error_at_ms)
+            if counters_json is not None:
+                updates.append("counters_json = ?")
+                params.append(counters_json)
+            params.append(1)
+            cur.execute(
+                "UPDATE app_status SET " + ", ".join(updates) + " WHERE id = ?",
+                params,
+            )
+        self._conn.commit()
+
+    def get_app_status(self) -> dict[str, Any] | None:
+        """Return singleton app_status row as dict, or None if not present."""
+        cur = self._conn.cursor()
+        cur.execute("SELECT * FROM app_status WHERE id = 1")
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+        return None
 
     def close(self) -> None:
         """Close DB connection."""

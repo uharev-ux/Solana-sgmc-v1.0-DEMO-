@@ -21,6 +21,10 @@ CHECK_PAIR_ADDRESS = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
 # --- Database ---
 DEFAULT_DB = "dexscreener.sqlite"
 
+# --- Logging ---
+LOG_DIR = "logs"
+LOG_FILE = "app.log"
+
 # --- Prune / age ---
 DEFAULT_PRUNE_MAX_AGE_HOURS = 24.0
 SELF_CHECK_AGE_HOURS = 24
@@ -66,6 +70,11 @@ ATH_MIN_TXNS_IN_WINDOW = 1       # min txns in window if txns available
 ATH_MIN_VOLUME_IN_WINDOW = 0.0   # min volume in window if volume available (0 = no floor)
 ATH_FALLBACK_MAX_ATTEMPTS = 10   # max candidate peaks to try when raw ATH is invalid
 
+# --- Bootstrap mode (insufficient price history: do not REJECT, use WATCHLIST_BOOTSTRAP) ---
+BOOTSTRAP_MIN_SNAPSHOTS = ATH_MIN_SNAPSHOTS_IN_WINDOW  # same threshold: skip ATH logic when below
+BOOTSTRAP_MIN_LIQ = 10_000.0   # same as WL1
+BOOTSTRAP_MIN_TXNS = 5         # same as WL1
+
 # --- 3-tier watchlist drop thresholds ---
 WL1_MIN_DROP = 25.0
 WL2_MIN_DROP = 35.0
@@ -85,3 +94,12 @@ TXNS_SIGNAL = 10
 BUYS_MIN = 5
 LIQ_SIGNAL = 5_000.0
 SIGNAL_COOLDOWN_SEC = 3600
+
+# --- Post-analysis: evaluate signals at 30/60/120 min ---
+POST_HORIZONS_SEC = [1800, 3600, 7200]
+
+# --- Trigger-based post-analysis (TP1/SL/BU) ---
+TP1_PCT = 40.0
+SL_PCT = -50.0
+TRIGGER_EVAL_MAX_AGE_SEC = 86400   # analyze only within token life (<=24h)
+TRIGGER_EVAL_MIN_SNAPSHOTS = 2

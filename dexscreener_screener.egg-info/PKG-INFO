@@ -1,3 +1,11 @@
+Metadata-Version: 2.4
+Name: dexscreener-screener
+Version: 1.0.0
+Summary: DexScreener Screener v1: collect and normalize Solana pair data from public API
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: httpx>=0.27.0
+
 # Solana-sgmc-v1.0-DEMO-
 Страшное позади, самое страшное впереди)
 

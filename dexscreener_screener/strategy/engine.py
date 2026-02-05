@@ -89,9 +89,10 @@ def _find_valid_ath(
     pair_address: str,
     since_ts: int | None,
     current_price: float,
-) -> tuple[float | None, int | None, dict[str, Any] | None, str] | None:
+) -> tuple[float | None, int | None, dict[str, Any] | None, str] | tuple[str, dict[str, Any]] | None:
     """
     Return (valid_ath_price, valid_ath_ts, ath_validation_metrics, ath_source) or None if no valid ATH.
+    Return ("BOOTSTRAP", activity) when ATH exists but insufficient snapshots in window (do not REJECT).
     ath_source is "raw" or "fallback".
     """
     ath_point = db.fetch_ath_point(pair_address, since_ts=since_ts)
@@ -108,6 +109,9 @@ def _find_valid_ath(
     if _validate_ath_activity(activity):
         return (raw_price, raw_ts, activity, "raw")
 
+    # Raw ATH failed; if failure due to insufficient snapshots, remember for bootstrap
+    bootstrap_activity = activity if (activity.get("snapshots_count") or 0) < config.ATH_MIN_SNAPSHOTS_IN_WINDOW else None
+
     candidates = db.fetch_ath_candidates(
         pair_address, since_ts=since_ts, limit=config.ATH_FALLBACK_MAX_ATTEMPTS
     )
@@ -117,6 +121,9 @@ def _find_valid_ath(
         act = db.fetch_activity_window(pair_address, ts, config.ATH_VALIDATE_WINDOW_SEC)
         if _validate_ath_activity(act):
             return (price, ts, act, "fallback")
+    # No valid ATH; if we had insufficient price history (snapshots in window), return BOOTSTRAP
+    if bootstrap_activity is not None:
+        return ("BOOTSTRAP", bootstrap_activity)
     return None
 
 
@@ -129,12 +136,13 @@ class StrategyEngine:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def run(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    def run(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         """
-        Run strategy once. Returns (signals, watchlist_l3, watchlist_l2, watchlist_l1).
+        Run strategy once. Returns (signals, watchlist_bootstrap, watchlist_l3, watchlist_l2, watchlist_l1).
         Each entry has pair_address, current_price, ath_price, drop_from_ath, liq, vol, txns, url, score, etc.
         """
         signals: list[dict[str, Any]] = []
+        watchlist_bootstrap: list[dict[str, Any]] = []
         watchlist_l3: list[dict[str, Any]] = []
         watchlist_l2: list[dict[str, Any]] = []
         watchlist_l1: list[dict[str, Any]] = []
@@ -159,6 +167,42 @@ class StrategyEngine:
             if current_price is None or current_price <= 0:
                 continue  # REJECT: current_price missing or <= 0
 
+            # Bootstrap: insufficient price history (fewer than BOOTSTRAP_MIN_SNAPSHOTS) -> WATCHLIST_BOOTSTRAP, not REJECT
+            snapshot_count = self.db.get_snapshot_count(pair_address)
+            if snapshot_count < config.BOOTSTRAP_MIN_SNAPSHOTS:
+                liq = _float(pair_row.get("liquidity_usd"))
+                vol = _float(pair_row.get("volume_h24"))
+                txns_h24 = _int(pair_row.get("txns_h24_buys")) + _int(pair_row.get("txns_h24_sells"))
+                if liq < config.BOOTSTRAP_MIN_LIQ or vol < config.STRATEGY_MIN_VOL or txns_h24 < config.BOOTSTRAP_MIN_TXNS:
+                    continue
+                url = str(pair_row.get("url") or "")
+                entry = {
+                    "pair_address": pair_address,
+                    "url": url,
+                    "current_price": current_price,
+                    "ath_price": None,
+                    "drop_from_ath": None,
+                    "score": 0.0,
+                    "liquidity_usd": liq,
+                    "volume_h24": vol,
+                    "txns_h24": txns_h24,
+                    "buys_h24": _int(pair_row.get("txns_h24_buys")),
+                }
+                watchlist_bootstrap.append(entry)
+                self.db.insert_strategy_decision(
+                    pair_address=pair_address,
+                    decision="WATCHLIST_BOOTSTRAP",
+                    current_price=current_price,
+                    ath_price=None,
+                    drop_from_ath=None,
+                    reasons_json=json.dumps({
+                        "reason": "insufficient_price_history",
+                        "ath_valid": False,
+                        "ath_validation_metrics": {"snapshots_count": snapshot_count},
+                    }),
+                )
+                continue
+
             valid_ath_result = _find_valid_ath(
                 self.db, pair_address, since_ts, current_price
             )
@@ -174,6 +218,42 @@ class StrategyEngine:
                         "ath_valid": False,
                         "ath_validation_metrics": None,
                         "ath_source": None,
+                    }),
+                )
+                continue
+
+            # Bootstrap: insufficient price history; apply hard filters only, no ATH logic
+            if isinstance(valid_ath_result, (tuple, list)) and len(valid_ath_result) == 2 and valid_ath_result[0] == "BOOTSTRAP":
+                _activity = valid_ath_result[1]
+                liq = _float(pair_row.get("liquidity_usd"))
+                vol = _float(pair_row.get("volume_h24"))
+                txns_h24 = _int(pair_row.get("txns_h24_buys")) + _int(pair_row.get("txns_h24_sells"))
+                if liq < config.BOOTSTRAP_MIN_LIQ or vol < config.STRATEGY_MIN_VOL or txns_h24 < config.BOOTSTRAP_MIN_TXNS:
+                    continue
+                url = str(pair_row.get("url") or "")
+                entry = {
+                    "pair_address": pair_address,
+                    "url": url,
+                    "current_price": current_price,
+                    "ath_price": None,
+                    "drop_from_ath": None,
+                    "score": 0.0,
+                    "liquidity_usd": liq,
+                    "volume_h24": vol,
+                    "txns_h24": txns_h24,
+                    "buys_h24": _int(pair_row.get("txns_h24_buys")),
+                }
+                watchlist_bootstrap.append(entry)
+                self.db.insert_strategy_decision(
+                    pair_address=pair_address,
+                    decision="WATCHLIST_BOOTSTRAP",
+                    current_price=current_price,
+                    ath_price=None,
+                    drop_from_ath=None,
+                    reasons_json=json.dumps({
+                        "reason": "insufficient_price_history",
+                        "ath_valid": False,
+                        "ath_validation_metrics": _activity,
                     }),
                 )
                 continue
@@ -259,6 +339,23 @@ class StrategyEngine:
                     }),
                 )
                 self.db.set_signal_cooldown(pair_address)
+                signal_id = self.db.insert_signal_event(
+                    pair_address=pair_address,
+                    signal_ts=now_ms,
+                    entry_price=current_price,
+                    ath_price=ath_price,
+                    drop_from_ath=drop_from_ath,
+                    score=score,
+                    features_json=json.dumps({
+                        "liquidity_usd": liq,
+                        "volume_h24": vol,
+                        "txns_h24": txns_h24,
+                        "buys_h24": buys_h24,
+                    }),
+                )
+                self.db.insert_trigger_eval_pending(signal_id)
+                for horizon_sec in config.POST_HORIZONS_SEC:
+                    self.db.insert_signal_evaluation(signal_id=signal_id, horizon_sec=horizon_sec, status="PENDING")
                 continue
 
             # Watchlist level
@@ -282,12 +379,12 @@ class StrategyEngine:
                 }),
             )
 
-        return signals, watchlist_l3, watchlist_l2, watchlist_l1
+        return signals, watchlist_bootstrap, watchlist_l3, watchlist_l2, watchlist_l1
 
 
 def run_strategy_once(
     db: Database,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Convenience: run StrategyEngine once. Returns (signals, watchlist_l3, watchlist_l2, watchlist_l1)."""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Convenience: run StrategyEngine once. Returns (signals, watchlist_bootstrap, watchlist_l3, watchlist_l2, watchlist_l1)."""
     engine = StrategyEngine(db)
     return engine.run()

@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dexscreener_screener import config
 from dexscreener_screener.storage import Database
+from dexscreener_screener.storage.sqlite import normalize_since_ts
 from dexscreener_screener.strategy.engine import _find_valid_ath
 
 
@@ -61,6 +62,15 @@ def main() -> int:
                 _info("  %s: %s", r["decision"], r["cnt"])
         else:
             _info("strategy_decisions: (empty)")
+
+    # --- Signal events and evaluations (post-analysis) ---
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signal_events'")
+    if cur.fetchone():
+        ev_cnt, pend_cnt, done_cnt, nodata_cnt = db.get_signal_event_counts()
+        _info("signal_events: count=%s", ev_cnt)
+        _info("signal_evaluations: PENDING=%s DONE=%s NO_DATA=%s", pend_cnt, done_cnt, nodata_cnt)
+    else:
+        _info("signal_events: (table not present)")
 
     anomalies: list[str] = []
     critical = False
@@ -123,9 +133,18 @@ def main() -> int:
             )
 
         valid_ath_result = _find_valid_ath(db, pair_address, since_ts, current_price)
-        valid_ath_price = valid_ath_result[0] if valid_ath_result else None
-        ath_source = valid_ath_result[3] if valid_ath_result else None  # raw / fallback
-        ath_validation_metrics = valid_ath_result[2] if valid_ath_result else None
+        if valid_ath_result and len(valid_ath_result) == 2 and valid_ath_result[0] == "BOOTSTRAP":
+            valid_ath_price = None
+            ath_source = "bootstrap"
+            ath_validation_metrics = valid_ath_result[1]
+        elif valid_ath_result:
+            valid_ath_price = valid_ath_result[0]
+            ath_source = valid_ath_result[3] if len(valid_ath_result) > 3 else None
+            ath_validation_metrics = valid_ath_result[2] if len(valid_ath_result) > 2 else None
+        else:
+            valid_ath_price = None
+            ath_source = None
+            ath_validation_metrics = None
 
         if valid_ath_price is not None and current_price is not None and current_price > 0 and valid_ath_price > 0:
             drop_from_ath = (valid_ath_price - current_price) / valid_ath_price * 100.0
@@ -138,9 +157,11 @@ def main() -> int:
         _info("    valid_ath_price=%s ath_source=%s drop_from_ath=%s", valid_ath_price, ath_source, drop_from_ath)
         if ath_source == "fallback":
             _info("    [FALLBACK] valid ATH is from fallback (raw ATH rejected)")
+        if ath_source == "bootstrap":
+            _info("    [BOOTSTRAP] insufficient price history (no valid ATH)")
 
         ath_price = valid_ath_price  # for anomaly checks below
-        if ath_price is None and row["cnt"] > 0:
+        if ath_price is None and row["cnt"] > 0 and ath_source != "bootstrap":
             anomalies.append("pair %s: ath_price is NULL but has snapshots" % pair_address[:20])
         if current_price is not None and last_snapshot_price is not None and abs(current_price - last_snapshot_price) > 1e-6:
             rel = abs(current_price - last_snapshot_price) / last_snapshot_price if last_snapshot_price else 0
@@ -153,6 +174,61 @@ def main() -> int:
                 anomalies.append("pair %s: drop_from_ath < 0 (%.2f)" % (pair_address[:20], drop_from_ath))
             if drop_from_ath > 99.9:
                 anomalies.append("pair %s: drop_from_ath > 99.9 (%.2f)" % (pair_address[:20], drop_from_ath))
+
+    # --- For 3 signals: per-horizon target_end_ts, count snapshots in window, status ---
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signal_events'")
+    if cur.fetchone():
+        cur.execute(
+            """
+            SELECT s.id AS signal_id, s.pair_address, s.signal_ts, e.id AS eval_id, e.horizon_sec, e.status
+            FROM signal_events s
+            JOIN signal_evaluations e ON e.signal_id = s.id
+            ORDER BY s.signal_ts DESC, e.horizon_sec ASC
+            LIMIT 30
+            """
+        )
+        eval_rows = [dict(r) for r in cur.fetchall()]
+        # Group by signal_id, take up to 3 signals
+        seen_signals = set()
+        signals_for_horizons = []
+        for r in eval_rows:
+            sid = r["signal_id"]
+            if sid not in seen_signals:
+                seen_signals.add(sid)
+                signals_for_horizons.append(sid)
+            if len(signals_for_horizons) >= 3:
+                break
+        if signals_for_horizons:
+            _info("signals (up to 3) per-horizon: target_end_ts, count snapshots in window, status")
+            snapshot_ts_is_ms = db._detect_snapshot_ts_unit()
+            for signal_id in signals_for_horizons[:3]:
+                cur.execute(
+                    "SELECT pair_address, signal_ts FROM signal_events WHERE id = ?",
+                    (signal_id,),
+                )
+                sig = cur.fetchone()
+                if not sig:
+                    continue
+                pair_address = sig["pair_address"]
+                signal_ts = int(sig["signal_ts"])
+                cur.execute(
+                    "SELECT id, horizon_sec, status FROM signal_evaluations WHERE signal_id = ? ORDER BY horizon_sec",
+                    (signal_id,),
+                )
+                evals = list(cur.fetchall())
+                _info("  signal_id=%s pair=%s signal_ts=%s", signal_id, pair_address[:32] + "...", signal_ts)
+                for e in evals:
+                    horizon_sec = int(e["horizon_sec"])
+                    ts_is_ms = signal_ts > 10**12
+                    horizon_unit = horizon_sec * 1000 if ts_is_ms else horizon_sec
+                    target_end_ts = signal_ts + horizon_unit
+                    since_norm = normalize_since_ts(signal_ts, snapshot_ts_is_ms)
+                    until_norm = normalize_since_ts(target_end_ts, snapshot_ts_is_ms)
+                    snap_count = cur.execute(
+                        "SELECT COUNT(*) FROM snapshots WHERE pair_address = ? AND snapshot_ts >= ? AND snapshot_ts <= ?",
+                        (pair_address, since_norm, until_norm),
+                    ).fetchone()[0]
+                    _info("    horizon_sec=%s target_end_ts=%s snapshots_in_window=%s status=%s", horizon_sec, target_end_ts, snap_count, e["status"])
 
     db.close()
 

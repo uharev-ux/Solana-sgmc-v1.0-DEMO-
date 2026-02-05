@@ -1,0 +1,2 @@
+[console_scripts]
+dexscreener-screener = dexscreener_screener.cli:main

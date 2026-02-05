@@ -14,7 +14,34 @@ from dexscreener_screener.logging_setup import get_logger, setup_logging
 from dexscreener_screener.models import PairSnapshot, from_api_pair
 from dexscreener_screener.pipeline import Collector, parse_addresses_input
 from dexscreener_screener.storage import Database
-from dexscreener_screener.strategy import run_strategy_once
+from dexscreener_screener.strategy import run_post_analysis, run_strategy_once
+from dexscreener_screener.strategy.trigger_analyzer import run_trigger_analysis
+
+
+def _update_app_status_success(db: Database, counters: dict | None = None) -> None:
+    """Update app_status on cycle success; clear last_error."""
+    try:
+        now_ms = int(time.time() * 1000)
+        db.update_app_status(
+            last_cycle_finished_at_ms=now_ms,
+            last_error="",
+            last_error_at_ms=None,
+            counters_json=json.dumps(counters) if counters else None,
+        )
+    except Exception:
+        pass
+
+
+def _update_app_status_error(db: Database, err: Exception) -> None:
+    """Update app_status on exception."""
+    try:
+        now_ms = int(time.time() * 1000)
+        db.update_app_status(
+            last_error=str(err)[:500],
+            last_error_at_ms=now_ms,
+        )
+    except Exception:
+        pass
 
 setup_logging()
 logger = get_logger(__name__)
@@ -171,42 +198,48 @@ def cmd_collect(args: argparse.Namespace) -> int:
     """Collect pairs by --tokens or --pairs, then optional auto-prune."""
     db_path = args.db or config.DEFAULT_DB
     db = Database(db_path)
-    client = DexScreenerClient(
-        timeout_sec=args.timeout,
-        max_retries=args.max_retries,
-        rate_limit_rps=args.rate_limit_rps,
-    )
-    collector = Collector(client, db)
-    if args.tokens is not None:
-        addresses = parse_addresses_input(args.tokens)
-        if not addresses:
-            logger.error("No token addresses parsed from: %s", args.tokens)
+    try:
+        client = DexScreenerClient(
+            timeout_sec=args.timeout,
+            max_retries=args.max_retries,
+            rate_limit_rps=args.rate_limit_rps,
+        )
+        collector = Collector(client, db)
+        if args.tokens is not None:
+            addresses = parse_addresses_input(args.tokens)
+            if not addresses:
+                logger.error("No token addresses parsed from: %s", args.tokens)
+                return 1
+            processed, errors = collector.collect_for_tokens(addresses)
+        elif args.pairs is not None:
+            addresses = parse_addresses_input(args.pairs)
+            if not addresses:
+                logger.error("No pair addresses parsed from: %s", args.pairs)
+                return 1
+            processed, errors = collector.collect_for_pairs(addresses)
+        else:
+            logger.error("Specify either --tokens or --pairs")
             return 1
-        processed, errors = collector.collect_for_tokens(addresses)
-    elif args.pairs is not None:
-        addresses = parse_addresses_input(args.pairs)
-        if not addresses:
-            logger.error("No pair addresses parsed from: %s", args.pairs)
-            return 1
-        processed, errors = collector.collect_for_pairs(addresses)
-    else:
-        logger.error("Specify either --tokens or --pairs")
-        return 1
 
-    if not getattr(args, "no_prune", False):
-        try:
-            max_h = getattr(args, "prune_max_age_hours", None) or config.DEFAULT_PRUNE_MAX_AGE_HOURS
-            s_cnt, p_cnt, t_cnt = db.prune_by_pair_age(max_age_hours=max_h, dry_run=False, vacuum=False)
-            logger.info("auto-prune: snapshots=%s pairs=%s tokens=%s", s_cnt, p_cnt, t_cnt)
-            dw_cnt = db.prune_dump_watchlist(ttl_hours=config.DUMP_WATCHLIST_TTL_HOURS)
-            if dw_cnt:
-                logger.info("dump-watchlist prune: removed %s", dw_cnt)
-        except Exception as e:
-            logger.warning("auto-prune skipped: %s", e)
+        if not getattr(args, "no_prune", False):
+            try:
+                max_h = getattr(args, "prune_max_age_hours", None) or config.DEFAULT_PRUNE_MAX_AGE_HOURS
+                s_cnt, p_cnt, t_cnt = db.prune_by_pair_age(max_age_hours=max_h, dry_run=False, vacuum=False)
+                logger.info("auto-prune: snapshots=%s pairs=%s tokens=%s", s_cnt, p_cnt, t_cnt)
+                dw_cnt = db.prune_dump_watchlist(ttl_hours=config.DUMP_WATCHLIST_TTL_HOURS)
+                if dw_cnt:
+                    logger.info("dump-watchlist prune: removed %s", dw_cnt)
+            except Exception as e:
+                logger.warning("auto-prune skipped: %s", e)
 
-    db.close()
-    logger.info("Done: %s pair(s) written, %s error(s)", processed, errors)
-    return 0 if errors == 0 else 0
+        _update_app_status_success(db, {"processed": processed, "errors": errors})
+        logger.info("Done: %s pair(s) written, %s error(s)", processed, errors)
+        return 0 if errors == 0 else 0
+    except Exception as e:
+        _update_app_status_error(db, e)
+        raise
+    finally:
+        db.close()
 
 
 def cmd_collect_new(args: argparse.Namespace) -> int:
@@ -321,9 +354,19 @@ def cmd_collect_new(args: argparse.Namespace) -> int:
                         logger.info("dump-watchlist prune: removed %s", dw_cnt)
                 except Exception as e:
                     logger.warning("auto-prune skipped: %s", e)
+            _update_app_status_success(
+                db,
+                {
+                    "cycle": cycle_num,
+                    "processed": cycle_processed,
+                    "snapshots": cycle_snapshots,
+                    "errors": cycle_errors,
+                },
+            )
         except Exception as e:
             cycle_errors = 1
             total_errors += 1
+            _update_app_status_error(db, e)
             logger.exception("collect-new cycle %s failed: %s", cycle_num, e)
 
         if shutdown:
@@ -365,14 +408,26 @@ def cmd_strategy(args: argparse.Namespace) -> int:
 
             signal.signal(signal.SIGINT, _on_sigint)
             while not shutdown[0]:
-                signals, wl3, wl2, wl1 = run_strategy_once(db)
-                _print_strategy_output(signals, wl3, wl2, wl1)
+                try:
+                    db.update_app_status(last_cycle_started_at_ms=int(time.time() * 1000))
+                    signals, wl_bootstrap, wl3, wl2, wl1 = run_strategy_once(db)
+                    _print_strategy_output(signals, wl_bootstrap, wl3, wl2, wl1)
+                    _update_app_status_success(db, {"signals": len(signals)})
+                except Exception as e:
+                    _update_app_status_error(db, e)
+                    raise
                 if shutdown[0]:
                     break
                 time.sleep(interval)
         else:
-            signals, wl3, wl2, wl1 = run_strategy_once(db)
-            _print_strategy_output(signals, wl3, wl2, wl1)
+            try:
+                db.update_app_status(last_cycle_started_at_ms=int(time.time() * 1000))
+                signals, wl_bootstrap, wl3, wl2, wl1 = run_strategy_once(db)
+                _print_strategy_output(signals, wl_bootstrap, wl3, wl2, wl1)
+                _update_app_status_success(db, {"signals": len(signals)})
+            except Exception as e:
+                _update_app_status_error(db, e)
+                raise
         return 0
     finally:
         db.close()
@@ -388,14 +443,16 @@ def _sort_entries(entries: list[dict]) -> list[dict]:
 
 def _print_strategy_output(
     signals: list[dict],
+    watchlist_bootstrap: list[dict],
     watchlist_l3: list[dict],
     watchlist_l2: list[dict],
     watchlist_l1: list[dict],
 ) -> None:
-    """Print SIGNAL, WATCHLIST_L3, WATCHLIST_L2, WATCHLIST_L1 separately. Sorted by score desc, drop_from_ath desc."""
+    """Print SIGNAL, WATCHLIST_BOOTSTRAP, WATCHLIST_L3, WATCHLIST_L2, WATCHLIST_L1. Sorted by score desc, drop_from_ath desc."""
     fmt = "%-44s %7s %12s %12s %6s"
     for section, entries in [
         ("SIGNAL", signals),
+        ("WATCHLIST_BOOTSTRAP", watchlist_bootstrap),
         ("WATCHLIST_L3", watchlist_l3),
         ("WATCHLIST_L2", watchlist_l2),
         ("WATCHLIST_L1", watchlist_l1),
@@ -425,6 +482,164 @@ def _print_strategy_output(
                             e.get("txns_h24") or 0,
                         )
                     )
+    print("---")
+
+
+def cmd_post(args: argparse.Namespace) -> int:
+    """
+    Run post-analysis: evaluate PENDING signal evaluations at configured horizons.
+    --once: run once and exit.
+    --loop N: run every N seconds until Ctrl+C.
+    """
+    db_path = args.db or config.DEFAULT_DB
+    if not Path(db_path).exists():
+        logger.error("Database not found: %s", db_path)
+        return 1
+
+    loop_sec = getattr(args, "loop", None) if not getattr(args, "once", False) else None
+    if loop_sec is not None:
+        interval = max(1, int(loop_sec))
+        shutdown = [False]
+
+        def _on_sigint(signum, frame):
+            if shutdown[0]:
+                sys.exit(1)
+            shutdown[0] = True
+            logger.info("SIGINT received, finishing cycle then exiting")
+
+        signal.signal(signal.SIGINT, _on_sigint)
+        while not shutdown[0]:
+            try:
+                db = Database(db_path)
+                db.update_app_status(last_cycle_started_at_ms=int(time.time() * 1000))
+                db.close()
+                done_cnt, no_data_cnt = run_post_analysis(db_path)
+                if done_cnt or no_data_cnt:
+                    logger.info("post-analysis: done=%s no_data=%s", done_cnt, no_data_cnt)
+                db = Database(db_path)
+                _update_app_status_success(db, {"done": done_cnt, "no_data": no_data_cnt})
+                db.close()
+            except Exception as e:
+                db = Database(db_path)
+                _update_app_status_error(db, e)
+                db.close()
+                raise
+            if shutdown[0]:
+                break
+            time.sleep(interval)
+    else:
+        try:
+            db = Database(db_path)
+            db.update_app_status(last_cycle_started_at_ms=int(time.time() * 1000))
+            db.close()
+            done_cnt, no_data_cnt = run_post_analysis(db_path)
+            logger.info("post-analysis: done=%s no_data=%s", done_cnt, no_data_cnt)
+            db = Database(db_path)
+            _update_app_status_success(db, {"done": done_cnt, "no_data": no_data_cnt})
+            db.close()
+        except Exception as e:
+            db = Database(db_path)
+            _update_app_status_error(db, e)
+            db.close()
+            raise
+    return 0
+
+
+def cmd_trigger(args: argparse.Namespace) -> int:
+    """
+    Run trigger-based post-analysis and print report.
+    --once: run once and exit.
+    --loop N: run every N seconds until Ctrl+C.
+    """
+    db_path = args.db or config.DEFAULT_DB
+    if not Path(db_path).exists():
+        logger.error("Database not found: %s", db_path)
+        return 1
+
+    loop_sec = getattr(args, "loop", None) if not getattr(args, "once", False) else None
+    if loop_sec is not None:
+        interval = max(1, int(loop_sec))
+        shutdown = [False]
+
+        def _on_sigint(signum, frame):
+            if shutdown[0]:
+                sys.exit(1)
+            shutdown[0] = True
+            logger.info("SIGINT received, finishing cycle then exiting")
+
+        signal.signal(signal.SIGINT, _on_sigint)
+        while not shutdown[0]:
+            try:
+                db = Database(db_path)
+                db.update_app_status(last_cycle_started_at_ms=int(time.time() * 1000))
+                db.close()
+                summary = run_trigger_analysis(db_path)
+                _print_trigger_report(summary)
+                db = Database(db_path)
+                _update_app_status_success(db, {"trigger_done": summary.get("trigger_done", 0)})
+                db.close()
+            except Exception as e:
+                db = Database(db_path)
+                _update_app_status_error(db, e)
+                db.close()
+                raise
+            if shutdown[0]:
+                break
+            time.sleep(interval)
+    else:
+        try:
+            db = Database(db_path)
+            db.update_app_status(last_cycle_started_at_ms=int(time.time() * 1000))
+            db.close()
+            summary = run_trigger_analysis(db_path)
+            _print_trigger_report(summary)
+            db = Database(db_path)
+            _update_app_status_success(db, {"trigger_done": summary.get("trigger_done", 0)})
+            db.close()
+        except Exception as e:
+            db = Database(db_path)
+            _update_app_status_error(db, e)
+            db.close()
+            raise
+    return 0
+
+
+def _print_trigger_report(summary: dict) -> None:
+    """Print trigger analysis report: counts, rates, top10."""
+    print("--- trigger report ---")
+    print("total signals: %s" % summary.get("total_signals", 0))
+    print("trigger evals: DONE=%s NO_DATA=%s PENDING=%s" % (
+        summary.get("trigger_done", 0),
+        summary.get("trigger_no_data", 0),
+        summary.get("trigger_pending", 0),
+    ))
+    print("outcome: TP1_FIRST=%s SL_FIRST=%s NEITHER=%s" % (
+        summary.get("outcome_tp1_first", 0),
+        summary.get("outcome_sl_first", 0),
+        summary.get("outcome_neither", 0),
+    ))
+    done = summary.get("trigger_done", 0)
+    if done:
+        print("TP1_HIT_RATE: %.2f" % (summary.get("tp1_hit_rate", 0) * 100))
+        print("SL_FIRST_RATE: %.2f" % (summary.get("sl_first_rate", 0) * 100))
+        tp1_first = summary.get("outcome_tp1_first", 0)
+        if tp1_first:
+            print("BU_AFTER_TP1_RATE: %.2f" % (summary.get("bu_after_tp1_rate", 0) * 100))
+        avg = summary.get("post_tp1_max_pct_avg")
+        med = summary.get("post_tp1_max_pct_median")
+        if avg is not None:
+            print("avg post_tp1_max_pct: %.2f" % avg)
+        if med is not None:
+            print("median post_tp1_max_pct: %.2f" % med)
+    top10 = summary.get("top10_post_tp1") or []
+    if top10:
+        print("top 10 post_tp1_max_pct:")
+        for e in top10:
+            pair = (e.get("pair_address") or "")[:44]
+            entry = e.get("entry_price")
+            pct = e.get("post_tp1_max_pct")
+            url = e.get("url") or ""
+            print("  %s entry=%.6g post_tp1_max_pct=%.2f %s" % (pair, entry, pct or 0, url))
     print("---")
 
 
@@ -642,6 +857,24 @@ def main() -> int:
     strategy_parser.add_argument("--once", action="store_true", help="Run once and exit")
     strategy_parser.add_argument("--loop", type=float, metavar="SEC", help="Run every N seconds until Ctrl+C")
     strategy_parser.set_defaults(func=cmd_strategy)
+
+    post_parser = subparsers.add_parser(
+        "post",
+        help="Post-analysis: evaluate signal quality at 30/60/120 min horizons",
+    )
+    post_parser.add_argument("--db", default=config.DEFAULT_DB, help="SQLite database path (default: %s)" % config.DEFAULT_DB)
+    post_parser.add_argument("--once", action="store_true", help="Run once and exit (default if no --loop)")
+    post_parser.add_argument("--loop", type=float, metavar="SEC", help="Run every N seconds until Ctrl+C")
+    post_parser.set_defaults(func=cmd_post)
+
+    trigger_parser = subparsers.add_parser(
+        "trigger",
+        help="Trigger-based post-analysis: TP1 40%%, SL -50%%, BU after TP1",
+    )
+    trigger_parser.add_argument("--db", default=config.DEFAULT_DB, help="SQLite database path (default: %s)" % config.DEFAULT_DB)
+    trigger_parser.add_argument("--once", action="store_true", help="Run once and exit (default if no --loop)")
+    trigger_parser.add_argument("--loop", type=float, metavar="SEC", help="Run every N seconds until Ctrl+C (e.g. 60)")
+    trigger_parser.set_defaults(func=cmd_trigger)
 
     args = parser.parse_args()
     return args.func(args)
