@@ -365,52 +365,66 @@ def cmd_strategy(args: argparse.Namespace) -> int:
 
             signal.signal(signal.SIGINT, _on_sigint)
             while not shutdown[0]:
-                watchlist, signals = run_strategy_once(db)
-                _print_strategy_output(watchlist, signals)
+                signals, wl3, wl2, wl1 = run_strategy_once(db)
+                _print_strategy_output(signals, wl3, wl2, wl1)
                 if shutdown[0]:
                     break
                 time.sleep(interval)
         else:
-            watchlist, signals = run_strategy_once(db)
-            _print_strategy_output(watchlist, signals)
+            signals, wl3, wl2, wl1 = run_strategy_once(db)
+            _print_strategy_output(signals, wl3, wl2, wl1)
         return 0
     finally:
         db.close()
 
 
+def _sort_entries(entries: list[dict]) -> list[dict]:
+    """Sort by score desc, then drop_from_ath desc."""
+    return sorted(
+        entries,
+        key=lambda e: (-float(e.get("score") or 0), -float(e.get("drop_from_ath") or 0)),
+    )
+
+
 def _print_strategy_output(
-    watchlist: list[dict],
     signals: list[dict],
+    watchlist_l3: list[dict],
+    watchlist_l2: list[dict],
+    watchlist_l1: list[dict],
 ) -> None:
-    """Print WATCHLIST and SIGNAL lines."""
-    print("--- WATCHLIST ---")
-    if not watchlist:
-        print("(none)")
-    else:
-        fmt = "%-44s %7s %12s %12s %6s"
-        print(fmt % ("pair", "drop%", "liq", "vol", "txns"))
-        for e in watchlist:
-            print(
-                fmt
-                % (
-                    (e.get("pair_address") or "")[:44],
-                    "%.1f" % (e.get("drop_from_ath") or 0),
-                    "%.0f" % (e.get("liquidity_usd") or 0),
-                    "%.0f" % (e.get("volume_h24") or 0),
-                    e.get("txns_h24") or 0,
-                )
-            )
-    print("--- SIGNAL ---")
-    if not signals:
-        print("(none)")
-    else:
-        for e in signals:
-            pair = (e.get("pair_address") or "")[:44]
-            drop = "%.1f" % (e.get("drop_from_ath") or 0)
-            ath = "%.6g" % (e.get("ath_price") or 0)
-            cur = "%.6g" % (e.get("current_price") or 0)
-            url = e.get("url") or ""
-            print("pair=%s drop_from_ath=%s%% ath_price=%s current_price=%s %s" % (pair, drop, ath, cur, url))
+    """Print SIGNAL, WATCHLIST_L3, WATCHLIST_L2, WATCHLIST_L1 separately. Sorted by score desc, drop_from_ath desc."""
+    fmt = "%-44s %7s %12s %12s %6s"
+    for section, entries in [
+        ("SIGNAL", signals),
+        ("WATCHLIST_L3", watchlist_l3),
+        ("WATCHLIST_L2", watchlist_l2),
+        ("WATCHLIST_L1", watchlist_l1),
+    ]:
+        print("--- %s ---" % section)
+        if not entries:
+            print("(none)")
+        else:
+            if section == "SIGNAL":
+                for e in _sort_entries(entries):
+                    pair = (e.get("pair_address") or "")[:44]
+                    drop = "%.1f" % (e.get("drop_from_ath") or 0)
+                    ath = "%.6g" % (e.get("ath_price") or 0)
+                    cur = "%.6g" % (e.get("current_price") or 0)
+                    url = e.get("url") or ""
+                    print("pair=%s drop_from_ath=%s%% ath_price=%s current_price=%s %s" % (pair, drop, ath, cur, url))
+            else:
+                print(fmt % ("pair", "drop%", "liq", "vol", "txns"))
+                for e in _sort_entries(entries):
+                    print(
+                        fmt
+                        % (
+                            (e.get("pair_address") or "")[:44],
+                            "%.1f" % (e.get("drop_from_ath") or 0),
+                            "%.0f" % (e.get("liquidity_usd") or 0),
+                            "%.0f" % (e.get("volume_h24") or 0),
+                            e.get("txns_h24") or 0,
+                        )
+                    )
     print("---")
 
 

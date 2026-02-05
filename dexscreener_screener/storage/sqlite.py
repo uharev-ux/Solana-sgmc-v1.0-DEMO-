@@ -137,6 +137,7 @@ IDX_DUMP_WATCHLIST_STATE = "CREATE INDEX IF NOT EXISTS idx_dump_watchlist_state 
 IDX_DUMP_WATCHLIST_UPDATED = "CREATE INDEX IF NOT EXISTS idx_dump_watchlist_updated ON dump_watchlist(updated_at_ms);"
 
 # --- Strategy layer (second screener): ATH-based drawdown ---
+# decision: REJECT | WATCHLIST_L1 | WATCHLIST_L2 | WATCHLIST_L3 | SIGNAL
 SCHEMA_STRATEGY_DECISIONS = """
 CREATE TABLE IF NOT EXISTS strategy_decisions (
     pair_address TEXT NOT NULL,

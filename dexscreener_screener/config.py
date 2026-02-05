@@ -66,9 +66,20 @@ ATH_MIN_TXNS_IN_WINDOW = 1       # min txns in window if txns available
 ATH_MIN_VOLUME_IN_WINDOW = 0.0   # min volume in window if volume available (0 = no floor)
 ATH_FALLBACK_MAX_ATTEMPTS = 10   # max candidate peaks to try when raw ATH is invalid
 
-WATCHLIST_MIN_DROP = 30.0
+# --- 3-tier watchlist drop thresholds ---
+WL1_MIN_DROP = 25.0
+WL2_MIN_DROP = 35.0
+WL3_MIN_DROP = 45.0
 SIGNAL_MIN_DROP = 50.0
 SIGNAL_MAX_DROP = 60.0
+
+# --- Market quality per watchlist level (downgrade if below) ---
+WL1_MIN_TXNS = 5
+WL2_MIN_TXNS = 7
+WL3_MIN_TXNS = 10
+WL1_MIN_LIQ = 10_000.0
+WL2_MIN_LIQ = 15_000.0
+WL3_MIN_LIQ = 20_000.0
 
 TXNS_SIGNAL = 10
 BUYS_MIN = 5

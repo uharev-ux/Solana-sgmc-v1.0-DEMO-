@@ -40,6 +40,36 @@ def compute_drop_from_ath(ath_price: float, current_price: float) -> float:
     return (ath_price - current_price) / ath_price * 100.0
 
 
+def _classify_by_drop(
+    drop: float, liq: float, txns: int, buys: int
+) -> str:
+    """
+    Classify by drop level; apply market_quality_downgrade if market is weak.
+    Returns: REJECT | WATCHLIST_L1 | WATCHLIST_L2 | WATCHLIST_L3 | SIGNAL
+    """
+    if drop < config.WL1_MIN_DROP:
+        return "REJECT"
+    if config.SIGNAL_MIN_DROP <= drop <= config.SIGNAL_MAX_DROP:
+        if txns >= config.TXNS_SIGNAL and buys >= config.BUYS_MIN and liq >= config.LIQ_SIGNAL:
+            return "SIGNAL"
+        return "REJECT"  # in signal zone but conditions not met
+    # Watchlist zone: determine initial level, then downgrade if weak market
+    if config.WL3_MIN_DROP <= drop < config.SIGNAL_MIN_DROP:
+        cand = "WATCHLIST_L3"
+    elif config.WL2_MIN_DROP <= drop < config.WL3_MIN_DROP:
+        cand = "WATCHLIST_L2"
+    else:  # WL1_MIN_DROP <= drop < WL2_MIN_DROP
+        cand = "WATCHLIST_L1"
+    # market_quality_downgrade
+    if cand == "WATCHLIST_L3" and (txns < config.WL3_MIN_TXNS or liq < config.WL3_MIN_LIQ):
+        cand = "WATCHLIST_L2"
+    if cand == "WATCHLIST_L2" and (txns < config.WL2_MIN_TXNS or liq < config.WL2_MIN_LIQ):
+        cand = "WATCHLIST_L1"
+    if cand == "WATCHLIST_L1" and (txns < config.WL1_MIN_TXNS or liq < config.WL1_MIN_LIQ):
+        return "REJECT"
+    return cand
+
+
 def _validate_ath_activity(activity: dict[str, Any]) -> bool:
     """True if activity window meets config thresholds (snapshots; txns/volume if present)."""
     snapshots_count = activity.get("snapshots_count") or 0
@@ -99,13 +129,15 @@ class StrategyEngine:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def run(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def run(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         """
-        Run strategy once. Returns (watchlist_entries, signal_entries).
-        Each entry has pair_address, current_price, ath_price, drop_from_ath, liq, vol, txns, url, etc.
+        Run strategy once. Returns (signals, watchlist_l3, watchlist_l2, watchlist_l1).
+        Each entry has pair_address, current_price, ath_price, drop_from_ath, liq, vol, txns, url, score, etc.
         """
-        watchlist: list[dict[str, Any]] = []
         signals: list[dict[str, Any]] = []
+        watchlist_l3: list[dict[str, Any]] = []
+        watchlist_l2: list[dict[str, Any]] = []
+        watchlist_l1: list[dict[str, Any]] = []
         now_ms = int(time.time() * 1000)
         max_age_ms = int(config.STRATEGY_MAX_AGE_HOURS * 3600 * 1000)
 
@@ -168,12 +200,14 @@ class StrategyEngine:
                 continue
 
             url = str(pair_row.get("url") or "")
+            score = drop_from_ath  # for sorting: higher drop = higher score
             entry = {
                 "pair_address": pair_address,
                 "url": url,
                 "current_price": current_price,
                 "ath_price": ath_price,
                 "drop_from_ath": drop_from_ath,
+                "score": score,
                 "liquidity_usd": liq,
                 "volume_h24": vol,
                 "txns_h24": txns_h24,
@@ -186,22 +220,26 @@ class StrategyEngine:
                 "ath_validation_metrics": ath_validation_metrics,
                 "ath_source": ath_source,
             }
-            if drop_from_ath >= config.WATCHLIST_MIN_DROP and drop_from_ath < config.SIGNAL_MIN_DROP:
-                watchlist.append(entry)
+
+            # Determine decision by drop level, then apply market_quality_downgrade
+            decision = _classify_by_drop(drop_from_ath, liq, txns_h24, buys_h24)
+            if decision == "REJECT":
                 self.db.insert_strategy_decision(
                     pair_address=pair_address,
-                    decision="WATCHLIST",
+                    decision="REJECT",
                     current_price=current_price,
                     ath_price=ath_price,
                     drop_from_ath=drop_from_ath,
-                    reasons_json=json.dumps({**base_reasons, "liq": liq, "vol": vol, "txns": txns_h24}),
+                    reasons_json=json.dumps({
+                        **base_reasons,
+                        "reason": "drop_below_wl1" if drop_from_ath < config.WL1_MIN_DROP else "market_quality_downgrade",
+                        "liq": liq,
+                        "txns": txns_h24,
+                    }),
                 )
-            elif (
-                config.SIGNAL_MIN_DROP <= drop_from_ath <= config.SIGNAL_MAX_DROP
-                and txns_h24 >= config.TXNS_SIGNAL
-                and buys_h24 >= config.BUYS_MIN
-                and liq >= config.LIQ_SIGNAL
-            ):
+                continue
+
+            if decision == "SIGNAL":
                 last_signal = self.db.get_last_signal_at(pair_address)
                 if last_signal is not None:
                     if (now_ms - last_signal) / 1000 < config.SIGNAL_COOLDOWN_SEC:
@@ -221,11 +259,35 @@ class StrategyEngine:
                     }),
                 )
                 self.db.set_signal_cooldown(pair_address)
+                continue
 
-        return watchlist, signals
+            # Watchlist level
+            if decision == "WATCHLIST_L3":
+                watchlist_l3.append(entry)
+            elif decision == "WATCHLIST_L2":
+                watchlist_l2.append(entry)
+            elif decision == "WATCHLIST_L1":
+                watchlist_l1.append(entry)
+            self.db.insert_strategy_decision(
+                pair_address=pair_address,
+                decision=decision,
+                current_price=current_price,
+                ath_price=ath_price,
+                drop_from_ath=drop_from_ath,
+                reasons_json=json.dumps({
+                    **base_reasons,
+                    "liq": liq,
+                    "vol": vol,
+                    "txns": txns_h24,
+                }),
+            )
+
+        return signals, watchlist_l3, watchlist_l2, watchlist_l1
 
 
-def run_strategy_once(db: Database) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Convenience: run StrategyEngine once. Returns (watchlist_entries, signal_entries)."""
+def run_strategy_once(
+    db: Database,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Convenience: run StrategyEngine once. Returns (signals, watchlist_l3, watchlist_l2, watchlist_l1)."""
     engine = StrategyEngine(db)
     return engine.run()

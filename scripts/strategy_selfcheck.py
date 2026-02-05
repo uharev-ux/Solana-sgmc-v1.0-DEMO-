@@ -46,6 +46,22 @@ def main() -> int:
     _info("snapshots_ts_min=%s snapshots_ts_max=%s", snapshots_ts_min, snapshots_ts_max)
     _info("pairs_count=%s", pairs_count)
 
+    # --- Strategy decisions: distribution by level ---
+    cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='strategy_decisions'"
+    )
+    if cur.fetchone():
+        cur.execute(
+            "SELECT decision, COUNT(*) AS cnt FROM strategy_decisions GROUP BY decision ORDER BY decision"
+        )
+        rows = cur.fetchall()
+        if rows:
+            _info("strategy_decisions by level:")
+            for r in rows:
+                _info("  %s: %s", r["decision"], r["cnt"])
+        else:
+            _info("strategy_decisions: (empty)")
+
     anomalies: list[str] = []
     critical = False
 
